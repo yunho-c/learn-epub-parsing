@@ -594,6 +594,7 @@ def parse_epub(
     media_all: bool = False,
     markdown_mode: str = "plain",
     style_mode: str = "inline",
+    split_chapters: bool = False,
 ) -> Optional[Path]:
     doc = Document(str(epub_path))
     metadata = doc.package.metadata
@@ -854,27 +855,46 @@ def parse_epub(
     if not sections:
         return None
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{book_slug}.md"
+    output_root = output_dir / book_slug if split_chapters else output_dir
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    lines: list[str] = [f"# {title}"]
+    base_lines: list[str] = [f"# {title}"]
     if authors:
-        lines.append(f"**Author:** {authors}")
+        base_lines.append(f"**Author:** {authors}")
     if style_header_lines:
-        lines.append("")
-        lines.extend(style_header_lines)
-    lines.append("")
+        base_lines.append("")
+        base_lines.extend(style_header_lines)
+    base_lines.append("")
 
-    for section_title, section_text in sections:
-        lines.append(f"## {section_title}")
-        lines.append("")
-        lines.append(section_text)
-        lines.append("")
+    if split_chapters:
+        width = max(2, len(str(len(sections))))
+        for index, (section_title, section_text) in enumerate(sections, start=1):
+            if section_title.strip():
+                section_slug = _slugify(section_title)
+            else:
+                section_slug = f"section_{index:0{width}d}"
+            filename = f"{index:0{width}d}_{section_slug}.md"
+            lines = list(base_lines)
+            lines.append(f"## {section_title}")
+            lines.append("")
+            lines.append(section_text)
+            lines.append("")
+            (output_root / filename).write_text(
+                "\n".join(lines).strip() + "\n", encoding="utf-8"
+            )
+    else:
+        output_path = output_root / f"{book_slug}.md"
+        lines: list[str] = list(base_lines)
+        for section_title, section_text in sections:
+            lines.append(f"## {section_title}")
+            lines.append("")
+            lines.append(section_text)
+            lines.append("")
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
-    output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
     if extracted_count:
         print(f"Extracted {extracted_count} images for {title}")
-    return output_path
+    return output_root if split_chapters else output_dir / f"{book_slug}.md"
 
 
 def main() -> int:
@@ -914,6 +934,11 @@ def main() -> int:
         default="inline",
         help="CSS handling for rich mode (inline or external).",
     )
+    parser.add_argument(
+        "--split-chapters",
+        action="store_true",
+        help="Write one Markdown file per chapter under the book slug directory.",
+    )
     args = parser.parse_args()
 
     epub_paths = sorted(args.input_dir.rglob("*.epub"))
@@ -930,6 +955,7 @@ def main() -> int:
                 media_all=args.media_all,
                 markdown_mode=args.markdown_mode,
                 style_mode=args.style,
+                split_chapters=args.split_chapters,
             )
         except Exception as exc:
             failures += 1
@@ -939,7 +965,10 @@ def main() -> int:
             failures += 1
             print(f"No readable content in {epub_path.name}")
         else:
-            print(f"Wrote {output_path}")
+            if args.split_chapters:
+                print(f"Wrote chapter files to {output_path}")
+            else:
+                print(f"Wrote {output_path}")
 
     return 0 if failures == 0 else 2
 
