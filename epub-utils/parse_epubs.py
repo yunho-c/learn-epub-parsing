@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 import argparse
+import posixpath
 import re
 from html.parser import HTMLParser
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from epub_utils import Document
 
+from lxml import etree
+
+
+_SECTION_CONTAINER_TAGS = {"section", "article", "div", "body"}
+_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_XHTML_MEDIA_TYPES = {"application/xhtml+xml", "text/html"}
+
+
+@dataclass(frozen=True)
+class TocEntry:
+    label: str
+    href: str
+    fragment: Optional[str]
+    order: int
+
+
+@dataclass
+class ContentData:
+    idref: str
+    href: str
+    xml: str
+    tree: Optional[etree._Element]
 
 class _HtmlToMarkdown(HTMLParser):
     BLOCK_TAGS = {
@@ -28,7 +52,7 @@ class _HtmlToMarkdown(HTMLParser):
         "th",
         "blockquote",
     }
-    HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+    HEADING_TAGS = _HEADING_TAGS
 
     def __init__(self) -> None:
         super().__init__()
@@ -93,6 +117,194 @@ def _html_to_markdown(text: str) -> str:
     parser = _HtmlToMarkdown()
     parser.feed(text)
     return parser.markdown()
+
+
+def _normalize_href(value: str) -> str:
+    value = value.strip().replace("\\", "/")
+    value = value.split("?", 1)[0]
+    return posixpath.normpath(value).lstrip("./")
+
+
+def _split_target(target: str) -> tuple[str, Optional[str]]:
+    if not target:
+        return "", None
+    href, _, fragment = target.partition("#")
+    return href, fragment or None
+
+
+def _flatten_toc_items(items: Iterable[object]) -> Iterable[object]:
+    for item in items:
+        yield item
+        children = getattr(item, "children", None)
+        if children:
+            yield from _flatten_toc_items(children)
+
+
+def _resolve_href(
+    href: str, manifest_by_href: dict[str, dict], manifest_by_basename: dict[str, str]
+) -> Optional[str]:
+    if not href:
+        return None
+    normalized = _normalize_href(href)
+    if normalized in manifest_by_href:
+        return normalized
+    while normalized.startswith("../"):
+        normalized = normalized[3:]
+        if normalized in manifest_by_href:
+            return normalized
+    basename = posixpath.basename(normalized)
+    if basename in manifest_by_basename:
+        return manifest_by_basename[basename]
+    matches = [key for key in manifest_by_href if key.endswith(f"/{basename}")]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _build_toc_entries(
+    doc: Document, manifest_by_href: dict[str, dict], spine_hrefs: set[str]
+) -> list[TocEntry]:
+    toc = doc.toc
+    if toc is None:
+        return []
+    try:
+        toc_items = toc.get_toc_items()
+    except Exception:
+        return []
+    manifest_by_basename: dict[str, str] = {}
+    basenames: dict[str, list[str]] = {}
+    for href in manifest_by_href:
+        base = posixpath.basename(href)
+        basenames.setdefault(base, []).append(href)
+    for base, hrefs in basenames.items():
+        if len(hrefs) == 1:
+            manifest_by_basename[base] = hrefs[0]
+
+    entries: list[TocEntry] = []
+    order = 0
+    for item in _flatten_toc_items(toc_items):
+        target = (getattr(item, "target", None) or "").strip()
+        label = (getattr(item, "label", None) or "").strip()
+        href, fragment = _split_target(target)
+        resolved = _resolve_href(href, manifest_by_href, manifest_by_basename)
+        if not resolved or resolved not in spine_hrefs:
+            continue
+        if not label:
+            label = _prettify_section_name(resolved)
+        entries.append(TocEntry(label=label, href=resolved, fragment=fragment, order=order))
+        order += 1
+    return entries
+
+
+def _load_content(doc: Document, idref: str, href: str) -> ContentData:
+    content = _get_content(doc, idref)
+    xml = getattr(content, "xml_content", None) or str(content)
+    tree = None
+    try:
+        tree = etree.fromstring(xml.encode("utf-8"))
+    except Exception:
+        tree = None
+    return ContentData(idref=idref, href=href, xml=xml, tree=tree)
+
+
+def _element_local_name(element) -> str:
+    tag = element.tag
+    if isinstance(tag, str) and "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag if isinstance(tag, str) else ""
+
+
+def _is_heading(element) -> bool:
+    return _element_local_name(element).lower() in _HEADING_TAGS
+
+
+def _heading_level(element) -> int:
+    name = _element_local_name(element).lower()
+    return int(name[1]) if name.startswith("h") and len(name) == 2 else 0
+
+
+def _find_anchor_node(tree, fragment: str):
+    if tree is None or not fragment:
+        return None
+    matches = tree.xpath(f'//*[@id="{fragment}"]')
+    if matches:
+        return matches[0]
+    matches = tree.xpath(f'//*[local-name()="a" and @name="{fragment}"]')
+    return matches[0] if matches else None
+
+
+def _find_section_container(node, allow_body: bool) -> Optional[object]:
+    current = node
+    while current is not None:
+        tag = _element_local_name(current).lower()
+        if tag in _SECTION_CONTAINER_TAGS:
+            if tag == "body" and not allow_body:
+                return None
+            return current
+        current = current.getparent()
+    return None
+
+
+def _collect_heading_section_nodes(heading) -> list[object]:
+    parent = heading.getparent()
+    if parent is None:
+        return [heading]
+    siblings = list(parent)
+    try:
+        start_index = siblings.index(heading)
+    except ValueError:
+        return [heading]
+    level = _heading_level(heading)
+    nodes: list[object] = []
+    for sibling in siblings[start_index:]:
+        if sibling is not heading and _is_heading(sibling):
+            if _heading_level(sibling) <= level:
+                break
+        nodes.append(sibling)
+    return nodes or [heading]
+
+
+def _section_nodes_from_anchor(anchor, allow_body: bool) -> list[object]:
+    node = anchor
+    tag = _element_local_name(node).lower()
+    if tag in {"a", "span"} and not list(node) and not (node.text or "").strip():
+        next_node = node.getnext()
+        if next_node is not None:
+            node = next_node
+    if _is_heading(node):
+        return _collect_heading_section_nodes(node)
+    container = _find_section_container(node, allow_body=allow_body)
+    if container is not None:
+        return [container]
+    return [node]
+
+
+def _nodes_to_html(nodes: Iterable[object]) -> str:
+    return "\n".join(etree.tostring(node, encoding="unicode") for node in nodes)
+
+
+def _render_markdown(html: str) -> str:
+    if not html.strip():
+        return ""
+    if _looks_like_html(html):
+        html = _html_to_markdown(html)
+    return _normalize_text(html)
+
+
+def _extract_section_markdown(
+    content: ContentData, fragment: str, allow_body: bool
+) -> Optional[str]:
+    anchor = _find_anchor_node(content.tree, fragment)
+    if anchor is None:
+        return None
+    nodes = _section_nodes_from_anchor(anchor, allow_body=allow_body)
+    if not nodes:
+        return None
+    return _render_markdown(_nodes_to_html(nodes))
+
+
+def _render_full_markdown(content: ContentData) -> str:
+    return _render_markdown(content.xml)
 
 
 def _collect_text_values(value: object) -> list[str]:
@@ -200,13 +412,19 @@ def parse_epub(epub_path: Path, output_dir: Path) -> Optional[Path]:
     title = _get_metadata_title(metadata) or epub_path.stem
     authors = _get_metadata_authors(metadata)
 
-    manifest_items = {
-        item.get("id"): item
+    manifest_list = [
+        item
         for item in getattr(doc.package.manifest, "items", [])
-        if isinstance(item, dict) and item.get("id")
+        if isinstance(item, dict)
+    ]
+    manifest_by_id = {item.get("id"): item for item in manifest_list if item.get("id")}
+    manifest_by_href = {
+        _normalize_href(item.get("href")): item
+        for item in manifest_list
+        if item.get("href")
     }
 
-    sections: list[tuple[str, str]] = []
+    spine_entries: list[tuple[str, str]] = []
     for spine_item in getattr(doc.package.spine, "itemrefs", []):
         if isinstance(spine_item, dict):
             content_id = spine_item.get("idref") or spine_item.get("id")
@@ -214,25 +432,92 @@ def parse_epub(epub_path: Path, output_dir: Path) -> Optional[Path]:
             content_id = getattr(spine_item, "idref", None) or getattr(spine_item, "id", None)
         if not content_id:
             continue
-        try:
-            content = _get_content(doc, content_id)
-        except Exception:
+        manifest_item = manifest_by_id.get(content_id)
+        if not manifest_item:
             continue
-        raw_text = _content_to_text(content)
-        if not raw_text.strip():
+        href = manifest_item.get("href")
+        if not href:
             continue
-        if _looks_like_html(raw_text):
-            raw_text = _html_to_markdown(raw_text)
-        text = _normalize_text(raw_text)
-        if not text:
+        if manifest_item.get("media_type") not in _XHTML_MEDIA_TYPES:
             continue
+        spine_entries.append((content_id, _normalize_href(href)))
 
-        manifest_item = manifest_items.get(content_id)
-        section_name = None
-        if manifest_item is not None:
-            section_name = manifest_item.get("href")
-        section_name = section_name or content_id
-        sections.append((_prettify_section_name(section_name), text))
+    spine_hrefs_set = {href for _, href in spine_entries}
+    spine_href_to_idref = {href: content_id for content_id, href in spine_entries}
+    toc_entries = _build_toc_entries(doc, manifest_by_href, spine_hrefs_set)
+
+    content_cache: dict[str, ContentData] = {}
+
+    def get_content_data(href: str) -> Optional[ContentData]:
+        if href in content_cache:
+            return content_cache[href]
+        idref = spine_href_to_idref.get(href)
+        if not idref:
+            return None
+        try:
+            data = _load_content(doc, idref, href)
+        except Exception:
+            return None
+        content_cache[href] = data
+        return data
+
+    sections: list[tuple[str, str]] = []
+
+    if toc_entries:
+        sections_by_entry: list[Optional[tuple[str, str]]] = [None] * len(toc_entries)
+        href_counts: dict[str, int] = {}
+        for entry in toc_entries:
+            href_counts[entry.href] = href_counts.get(entry.href, 0) + 1
+        href_has_section = {href: False for href in href_counts}
+        first_index_by_href: dict[str, int] = {}
+        seen_texts_by_href: dict[str, set[str]] = {
+            href: set() for href in href_counts
+        }
+
+        for idx, entry in enumerate(toc_entries):
+            first_index_by_href.setdefault(entry.href, idx)
+            content_data = get_content_data(entry.href)
+            if content_data is None:
+                continue
+            allow_body = href_counts[entry.href] == 1
+            text = None
+            if entry.fragment:
+                text = _extract_section_markdown(
+                    content_data, entry.fragment, allow_body=allow_body
+                )
+            elif allow_body:
+                text = _render_full_markdown(content_data)
+            if text:
+                if text in seen_texts_by_href[entry.href]:
+                    continue
+                seen_texts_by_href[entry.href].add(text)
+                sections_by_entry[idx] = (entry.label, text)
+                href_has_section[entry.href] = True
+
+        for href, has_section in href_has_section.items():
+            if has_section:
+                continue
+            first_index = first_index_by_href.get(href)
+            if first_index is None:
+                continue
+            content_data = get_content_data(href)
+            if content_data is None:
+                continue
+            text = _render_full_markdown(content_data)
+            if not text:
+                continue
+            sections_by_entry[first_index] = (toc_entries[first_index].label, text)
+
+        sections = [section for section in sections_by_entry if section]
+    else:
+        for _, href in spine_entries:
+            content_data = get_content_data(href)
+            if content_data is None:
+                continue
+            text = _render_full_markdown(content_data)
+            if not text:
+                continue
+            sections.append((_prettify_section_name(href), text))
 
     if not sections:
         return None
