@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import posixpath
 import re
+import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from epub_utils import Document
 
@@ -35,6 +36,7 @@ class ContentData:
     xml: str
     tree: Optional[etree._Element]
 
+
 class _HtmlToMarkdown(HTMLParser):
     BLOCK_TAGS = {
         "p",
@@ -55,12 +57,13 @@ class _HtmlToMarkdown(HTMLParser):
     HEADING_TAGS = _HEADING_TAGS
     IGNORE_TAGS = {"head", "title", "style", "script", "svg"}
 
-    def __init__(self) -> None:
+    def __init__(self, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None) -> None:
         super().__init__()
         self._lines: list[str] = []
         self._heading_level: Optional[int] = None
         self._heading_chunks: list[str] = []
         self._ignore_depth = 0
+        self._image_resolver = image_resolver
 
     def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
         tag = tag.lower()
@@ -68,6 +71,18 @@ class _HtmlToMarkdown(HTMLParser):
             self._ignore_depth += 1
             return
         if self._ignore_depth:
+            return
+        if tag == "img":
+            attr_map = {key.lower(): value for key, value in attrs}
+            src = attr_map.get("src", "") or ""
+            alt = attr_map.get("alt", "") or ""
+            resolved = None
+            if self._image_resolver:
+                resolved = self._image_resolver(src, alt)
+            if resolved:
+                self._ensure_blank_line()
+                self._lines.append(f"![{alt}]({resolved})")
+                self._ensure_blank_line()
             return
         if tag in self.HEADING_TAGS:
             self._heading_level = int(tag[1])
@@ -118,6 +133,18 @@ class _HtmlToMarkdown(HTMLParser):
         tag = tag.lower()
         if tag in self.IGNORE_TAGS or self._ignore_depth:
             return
+        if tag == "img":
+            attr_map = {key.lower(): value for key, value in attrs}
+            src = attr_map.get("src", "") or ""
+            alt = attr_map.get("alt", "") or ""
+            resolved = None
+            if self._image_resolver:
+                resolved = self._image_resolver(src, alt)
+            if resolved:
+                self._ensure_blank_line()
+                self._lines.append(f"![{alt}]({resolved})")
+                self._ensure_blank_line()
+            return
         if tag in self.BLOCK_TAGS:
             self._ensure_blank_line()
 
@@ -135,8 +162,10 @@ def _looks_like_html(text: str) -> bool:
     return "<" in text and ">" in text and re.search(r"</?[a-zA-Z]", text) is not None
 
 
-def _html_to_markdown(text: str) -> str:
-    parser = _HtmlToMarkdown()
+def _html_to_markdown(
+    text: str, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+) -> str:
+    parser = _HtmlToMarkdown(image_resolver=image_resolver)
     parser.feed(text)
     return parser.markdown()
 
@@ -145,6 +174,37 @@ def _normalize_href(value: str) -> str:
     value = value.strip().replace("\\", "/")
     value = value.split("?", 1)[0]
     return posixpath.normpath(value).lstrip("./")
+
+
+def _is_external_src(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith(("http://", "https://", "data:"))
+
+
+def _zip_namelist_map(epub_zip: zipfile.ZipFile) -> dict[str, str]:
+    return {
+        posixpath.normpath(name).lstrip("./"): name
+        for name in epub_zip.namelist()
+    }
+
+
+def _zip_has(namelist_map: dict[str, str], path: str) -> bool:
+    return posixpath.normpath(path).lstrip("./") in namelist_map
+
+
+def _extract_zip_file(
+    epub_zip: zipfile.ZipFile,
+    namelist_map: dict[str, str],
+    zip_path: str,
+    output_path: Path,
+) -> bool:
+    normalized = posixpath.normpath(zip_path).lstrip("./")
+    if normalized not in namelist_map:
+        return False
+    data = epub_zip.read(namelist_map[normalized])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(data)
+    return True
 
 
 def _split_target(target: str) -> tuple[str, Optional[str]]:
@@ -305,16 +365,21 @@ def _nodes_to_html(nodes: Iterable[object]) -> str:
     return "\n".join(etree.tostring(node, encoding="unicode") for node in nodes)
 
 
-def _render_markdown(html: str) -> str:
+def _render_markdown(
+    html: str, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+) -> str:
     if not html.strip():
         return ""
     if _looks_like_html(html):
-        html = _html_to_markdown(html)
+        html = _html_to_markdown(html, image_resolver=image_resolver)
     return _normalize_text(html)
 
 
 def _extract_section_markdown(
-    content: ContentData, fragment: str, allow_body: bool
+    content: ContentData,
+    fragment: str,
+    allow_body: bool,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
 ) -> Optional[str]:
     anchor = _find_anchor_node(content.tree, fragment)
     if anchor is None:
@@ -322,15 +387,17 @@ def _extract_section_markdown(
     nodes = _section_nodes_from_anchor(anchor, allow_body=allow_body)
     if not nodes:
         return None
-    return _render_markdown(_nodes_to_html(nodes))
+    return _render_markdown(_nodes_to_html(nodes), image_resolver=image_resolver)
 
 
-def _render_full_markdown(content: ContentData) -> str:
+def _render_full_markdown(
+    content: ContentData, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+) -> str:
     if content.tree is not None:
         body_nodes = content.tree.xpath('//*[local-name()="body"]')
         if body_nodes:
-            return _render_markdown(_nodes_to_html(body_nodes))
-    return _render_markdown(content.xml)
+            return _render_markdown(_nodes_to_html(body_nodes), image_resolver=image_resolver)
+    return _render_markdown(content.xml, image_resolver=image_resolver)
 
 
 def _collect_text_values(value: object) -> list[str]:
@@ -432,11 +499,12 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
-def parse_epub(epub_path: Path, output_dir: Path) -> Optional[Path]:
+def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Optional[Path]:
     doc = Document(str(epub_path))
     metadata = doc.package.metadata
     title = _get_metadata_title(metadata) or epub_path.stem
     authors = _get_metadata_authors(metadata)
+    book_slug = _slugify(title)
 
     manifest_list = [
         item
@@ -489,67 +557,124 @@ def parse_epub(epub_path: Path, output_dir: Path) -> Optional[Path]:
 
     sections: list[tuple[str, str]] = []
 
-    if toc_entries:
-        sections_by_entry: list[Optional[tuple[str, str]]] = [None] * len(toc_entries)
-        href_counts: dict[str, int] = {}
-        for entry in toc_entries:
-            href_counts[entry.href] = href_counts.get(entry.href, 0) + 1
-        href_has_section = {href: False for href in href_counts}
-        first_index_by_href: dict[str, int] = {}
-        seen_texts_by_href: dict[str, set[str]] = {
-            href: set() for href in href_counts
-        }
+    image_output_root = output_dir / book_slug / "images"
+    extracted_images: dict[str, str] = {}
+    extracted_count = 0
 
-        for idx, entry in enumerate(toc_entries):
-            first_index_by_href.setdefault(entry.href, idx)
-            content_data = get_content_data(entry.href)
-            if content_data is None:
-                continue
-            allow_body = href_counts[entry.href] == 1
-            text = None
-            if entry.fragment:
-                text = _extract_section_markdown(
-                    content_data, entry.fragment, allow_body=allow_body
-                )
-            elif allow_body:
-                text = _render_full_markdown(content_data)
-            if text:
-                if text in seen_texts_by_href[entry.href]:
+    with zipfile.ZipFile(epub_path, "r") as epub_zip:
+        zip_map = _zip_namelist_map(epub_zip)
+
+        def extract_media_href(href: str) -> Optional[str]:
+            nonlocal extracted_count
+            if href in extracted_images:
+                return extracted_images[href]
+            zip_path = posixpath.join(doc.package_href, href)
+            output_path = image_output_root / href
+            if not _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
+                return None
+            rel_path = f"./{book_slug}/images/{href}"
+            extracted_images[href] = rel_path
+            extracted_count += 1
+            return rel_path
+
+        if media_all:
+            for item in manifest_list:
+                media_type = item.get("media_type") or ""
+                if not media_type.startswith("image/"):
                     continue
-                seen_texts_by_href[entry.href].add(text)
-                sections_by_entry[idx] = (entry.label, text)
-                href_has_section[entry.href] = True
+                href = item.get("href")
+                if not href:
+                    continue
+                normalized = _normalize_href(href)
+                extract_media_href(normalized)
 
-        for href, has_section in href_has_section.items():
-            if has_section:
-                continue
-            first_index = first_index_by_href.get(href)
-            if first_index is None:
-                continue
-            content_data = get_content_data(href)
-            if content_data is None:
-                continue
-            text = _render_full_markdown(content_data)
-            if not text:
-                continue
-            sections_by_entry[first_index] = (toc_entries[first_index].label, text)
+        def make_image_resolver(base_href: str) -> Callable[[str, str], Optional[str]]:
+            def resolve_image(src: str, alt: str) -> Optional[str]:
+                if not src or _is_external_src(src):
+                    return src or None
+                resolved = _normalize_href(
+                    posixpath.join(posixpath.dirname(base_href), src)
+                )
+                manifest_item = manifest_by_href.get(resolved)
+                if manifest_item:
+                    href = resolved
+                else:
+                    zip_path = posixpath.join(doc.package_href, resolved)
+                    if not _zip_has(zip_map, zip_path):
+                        return src
+                    href = resolved
+                extracted = extract_media_href(href)
+                return extracted or src
 
-        sections = [section for section in sections_by_entry if section]
-    else:
-        for _, href in spine_entries:
-            content_data = get_content_data(href)
-            if content_data is None:
-                continue
-            text = _render_full_markdown(content_data)
-            if not text:
-                continue
-            sections.append((_prettify_section_name(href), text))
+            return resolve_image
+
+        if toc_entries:
+            sections_by_entry: list[Optional[tuple[str, str]]] = [None] * len(toc_entries)
+            href_counts: dict[str, int] = {}
+            for entry in toc_entries:
+                href_counts[entry.href] = href_counts.get(entry.href, 0) + 1
+            href_has_section = {href: False for href in href_counts}
+            first_index_by_href: dict[str, int] = {}
+            seen_texts_by_href: dict[str, set[str]] = {
+                href: set() for href in href_counts
+            }
+
+            for idx, entry in enumerate(toc_entries):
+                first_index_by_href.setdefault(entry.href, idx)
+                content_data = get_content_data(entry.href)
+                if content_data is None:
+                    continue
+                image_resolver = make_image_resolver(content_data.href)
+                allow_body = href_counts[entry.href] == 1
+                text = None
+                if entry.fragment:
+                    text = _extract_section_markdown(
+                        content_data,
+                        entry.fragment,
+                        allow_body=allow_body,
+                        image_resolver=image_resolver,
+                    )
+                elif allow_body:
+                    text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                if text:
+                    if text in seen_texts_by_href[entry.href]:
+                        continue
+                    seen_texts_by_href[entry.href].add(text)
+                    sections_by_entry[idx] = (entry.label, text)
+                    href_has_section[entry.href] = True
+
+            for href, has_section in href_has_section.items():
+                if has_section:
+                    continue
+                first_index = first_index_by_href.get(href)
+                if first_index is None:
+                    continue
+                content_data = get_content_data(href)
+                if content_data is None:
+                    continue
+                image_resolver = make_image_resolver(content_data.href)
+                text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                if not text:
+                    continue
+                sections_by_entry[first_index] = (toc_entries[first_index].label, text)
+
+            sections = [section for section in sections_by_entry if section]
+        else:
+            for _, href in spine_entries:
+                content_data = get_content_data(href)
+                if content_data is None:
+                    continue
+                image_resolver = make_image_resolver(content_data.href)
+                text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                if not text:
+                    continue
+                sections.append((_prettify_section_name(href), text))
 
     if not sections:
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{_slugify(title)}.md"
+    output_path = output_dir / f"{book_slug}.md"
 
     lines: list[str] = [f"# {title}"]
     if authors:
@@ -563,6 +688,8 @@ def parse_epub(epub_path: Path, output_dir: Path) -> Optional[Path]:
         lines.append("")
 
     output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    if extracted_count:
+        print(f"Extracted {extracted_count} images for {title}")
     return output_path
 
 
@@ -586,6 +713,11 @@ def main() -> int:
         default=default_output,
         help=f"Output directory for Markdown files (default: {default_output})",
     )
+    parser.add_argument(
+        "--media-all",
+        action="store_true",
+        help="Extract all manifest images, not just those referenced in content.",
+    )
     args = parser.parse_args()
 
     epub_paths = sorted(args.input_dir.rglob("*.epub"))
@@ -596,7 +728,7 @@ def main() -> int:
     failures = 0
     for epub_path in epub_paths:
         try:
-            output_path = parse_epub(epub_path, args.output_dir)
+            output_path = parse_epub(epub_path, args.output_dir, media_all=args.media_all)
         except Exception as exc:
             failures += 1
             print(f"Failed to parse {epub_path.name}: {exc}")
