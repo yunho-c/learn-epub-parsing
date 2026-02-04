@@ -19,6 +19,18 @@ from lxml import etree
 _SECTION_CONTAINER_TAGS = {"section", "article", "div", "body"}
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _XHTML_MEDIA_TYPES = {"application/xhtml+xml", "text/html"}
+_COMPLEX_HTML_TAGS = {
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "td",
+    "th",
+    "figure",
+    "figcaption",
+    "svg",
+    "math",
+}
 
 
 @dataclass(frozen=True)
@@ -192,6 +204,15 @@ def _zip_has(namelist_map: dict[str, str], path: str) -> bool:
     return posixpath.normpath(path).lstrip("./") in namelist_map
 
 
+def _read_zip_bytes(
+    epub_zip: zipfile.ZipFile, namelist_map: dict[str, str], zip_path: str
+) -> Optional[bytes]:
+    normalized = posixpath.normpath(zip_path).lstrip("./")
+    if normalized not in namelist_map:
+        return None
+    return epub_zip.read(namelist_map[normalized])
+
+
 def _extract_zip_file(
     epub_zip: zipfile.ZipFile,
     namelist_map: dict[str, str],
@@ -361,6 +382,35 @@ def _section_nodes_from_anchor(anchor, allow_body: bool) -> list[object]:
     return [node]
 
 
+def _has_style_or_class(node) -> bool:
+    for element in node.iter():
+        if element.get("style") or element.get("class"):
+            return True
+    return False
+
+
+def _is_complex_html_node(node) -> bool:
+    tag = _element_local_name(node).lower()
+    if tag in _COMPLEX_HTML_TAGS:
+        return True
+    if _has_style_or_class(node):
+        return True
+    return False
+
+
+def _rewrite_image_sources(
+    node, image_resolver: Optional[Callable[[str, str], Optional[str]]]
+) -> None:
+    if image_resolver is None:
+        return
+    for img in node.xpath('.//*[local-name()="img"]'):
+        src = img.get("src") or ""
+        alt = img.get("alt") or ""
+        resolved = image_resolver(src, alt)
+        if resolved:
+            img.set("src", resolved)
+
+
 def _nodes_to_html(nodes: Iterable[object]) -> str:
     return "\n".join(etree.tostring(node, encoding="unicode") for node in nodes)
 
@@ -380,6 +430,7 @@ def _extract_section_markdown(
     fragment: str,
     allow_body: bool,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    markdown_mode: str = "plain",
 ) -> Optional[str]:
     anchor = _find_anchor_node(content.tree, fragment)
     if anchor is None:
@@ -387,6 +438,8 @@ def _extract_section_markdown(
     nodes = _section_nodes_from_anchor(anchor, allow_body=allow_body)
     if not nodes:
         return None
+    if markdown_mode == "rich":
+        return _render_rich_from_nodes(nodes, image_resolver=image_resolver)
     return _render_markdown(_nodes_to_html(nodes), image_resolver=image_resolver)
 
 
@@ -398,6 +451,42 @@ def _render_full_markdown(
         if body_nodes:
             return _render_markdown(_nodes_to_html(body_nodes), image_resolver=image_resolver)
     return _render_markdown(content.xml, image_resolver=image_resolver)
+
+
+def _render_rich_from_nodes(
+    nodes: Iterable[object], image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+) -> str:
+    chunks: list[str] = []
+    for node in nodes:
+        if _is_complex_html_node(node):
+            _rewrite_image_sources(node, image_resolver)
+            chunks.append(etree.tostring(node, encoding="unicode"))
+        else:
+            html = etree.tostring(node, encoding="unicode")
+            text = _render_markdown(html, image_resolver=image_resolver)
+            if text:
+                chunks.append(text)
+        if node.tail and node.tail.strip():
+            chunks.append(node.tail.strip())
+    return _normalize_text("\n\n".join(chunks))
+
+
+def _render_full_rich_markdown(
+    content: ContentData, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+) -> str:
+    if content.tree is None:
+        return _render_full_markdown(content, image_resolver=image_resolver)
+    body_nodes = content.tree.xpath('//*[local-name()="body"]')
+    if not body_nodes:
+        return _render_full_markdown(content, image_resolver=image_resolver)
+    body = body_nodes[0]
+    chunks: list[str] = []
+    if body.text and body.text.strip():
+        chunks.append(body.text.strip())
+    body_chunks = _render_rich_from_nodes(list(body), image_resolver=image_resolver)
+    if body_chunks:
+        chunks.append(body_chunks)
+    return _normalize_text("\n\n".join(chunks))
 
 
 def _collect_text_values(value: object) -> list[str]:
@@ -499,7 +588,13 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
-def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Optional[Path]:
+def parse_epub(
+    epub_path: Path,
+    output_dir: Path,
+    media_all: bool = False,
+    markdown_mode: str = "plain",
+    style_mode: str = "inline",
+) -> Optional[Path]:
     doc = Document(str(epub_path))
     metadata = doc.package.metadata
     title = _get_metadata_title(metadata) or epub_path.stem
@@ -561,6 +656,10 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
     extracted_images: dict[str, str] = {}
     extracted_count = 0
 
+    css_hrefs: set[str] = set()
+    inline_styles: list[str] = []
+    style_header_lines: list[str] = []
+
     with zipfile.ZipFile(epub_path, "r") as epub_zip:
         zip_map = _zip_namelist_map(epub_zip)
 
@@ -571,6 +670,7 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
             zip_path = posixpath.join(doc.package_href, href)
             output_path = image_output_root / href
             if not _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
+                print(f"Warning: missing media '{href}' in {epub_path.name}")
                 return None
             rel_path = f"./{book_slug}/images/{href}"
             extracted_images[href] = rel_path
@@ -608,6 +708,33 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
 
             return resolve_image
 
+        def record_css_for_content(content_data: ContentData) -> None:
+            if markdown_mode != "rich":
+                return
+            if content_data.tree is None:
+                return
+            head_nodes = content_data.tree.xpath('//*[local-name()="head"]')
+            if not head_nodes:
+                return
+            head = head_nodes[0]
+            for link in head.xpath('.//*[local-name()="link"]'):
+                rel = (link.get("rel") or "").lower()
+                if "stylesheet" not in rel:
+                    continue
+                href = link.get("href") or ""
+                if not href or _is_external_src(href):
+                    continue
+                resolved = _normalize_href(
+                    posixpath.join(posixpath.dirname(content_data.href), href)
+                )
+                zip_path = posixpath.join(doc.package_href, resolved)
+                if _zip_has(zip_map, zip_path):
+                    css_hrefs.add(resolved)
+            for style_node in head.xpath('.//*[local-name()="style"]'):
+                style_text = "".join(style_node.itertext()).strip()
+                if style_text:
+                    inline_styles.append(style_text)
+
         if toc_entries:
             sections_by_entry: list[Optional[tuple[str, str]]] = [None] * len(toc_entries)
             href_counts: dict[str, int] = {}
@@ -624,6 +751,7 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
                 content_data = get_content_data(entry.href)
                 if content_data is None:
                     continue
+                record_css_for_content(content_data)
                 image_resolver = make_image_resolver(content_data.href)
                 allow_body = href_counts[entry.href] == 1
                 text = None
@@ -633,9 +761,17 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
                         entry.fragment,
                         allow_body=allow_body,
                         image_resolver=image_resolver,
+                        markdown_mode=markdown_mode,
                     )
                 elif allow_body:
-                    text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                    if markdown_mode == "rich":
+                        text = _render_full_rich_markdown(
+                            content_data, image_resolver=image_resolver
+                        )
+                    else:
+                        text = _render_full_markdown(
+                            content_data, image_resolver=image_resolver
+                        )
                 if text:
                     if text in seen_texts_by_href[entry.href]:
                         continue
@@ -652,8 +788,14 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
                 content_data = get_content_data(href)
                 if content_data is None:
                     continue
+                record_css_for_content(content_data)
                 image_resolver = make_image_resolver(content_data.href)
-                text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                if markdown_mode == "rich":
+                    text = _render_full_rich_markdown(
+                        content_data, image_resolver=image_resolver
+                    )
+                else:
+                    text = _render_full_markdown(content_data, image_resolver=image_resolver)
                 if not text:
                     continue
                 sections_by_entry[first_index] = (toc_entries[first_index].label, text)
@@ -664,11 +806,50 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
                 content_data = get_content_data(href)
                 if content_data is None:
                     continue
+                record_css_for_content(content_data)
                 image_resolver = make_image_resolver(content_data.href)
-                text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                if markdown_mode == "rich":
+                    text = _render_full_rich_markdown(
+                        content_data, image_resolver=image_resolver
+                    )
+                else:
+                    text = _render_full_markdown(content_data, image_resolver=image_resolver)
                 if not text:
                     continue
                 sections.append((_prettify_section_name(href), text))
+
+        if markdown_mode == "rich" and (css_hrefs or inline_styles):
+            if style_mode == "external":
+                styles_root = output_dir / book_slug / "styles"
+                for href in sorted(css_hrefs):
+                    zip_path = posixpath.join(doc.package_href, href)
+                    output_path = styles_root / href
+                    if _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
+                        rel_path = f"./{book_slug}/styles/{href}"
+                        style_header_lines.append(
+                            f'<link rel="stylesheet" href="{rel_path}">'
+                        )
+                if inline_styles:
+                    inline_css_path = styles_root / "inline_styles.css"
+                    inline_css_path.parent.mkdir(parents=True, exist_ok=True)
+                    inline_css_path.write_text(
+                        "\n\n".join(inline_styles).strip() + "\n", encoding="utf-8"
+                    )
+                    style_header_lines.append(
+                        f'<link rel="stylesheet" href="./{book_slug}/styles/inline_styles.css">'
+                    )
+            else:
+                css_chunks: list[str] = []
+                for href in sorted(css_hrefs):
+                    zip_path = posixpath.join(doc.package_href, href)
+                    data = _read_zip_bytes(epub_zip, zip_map, zip_path)
+                    if data:
+                        css_chunks.append(data.decode("utf-8", errors="ignore"))
+                css_chunks.extend(inline_styles)
+                if css_chunks:
+                    style_header_lines.append("<style>")
+                    style_header_lines.append("\n\n".join(css_chunks).strip())
+                    style_header_lines.append("</style>")
 
     if not sections:
         return None
@@ -679,6 +860,9 @@ def parse_epub(epub_path: Path, output_dir: Path, media_all: bool = False) -> Op
     lines: list[str] = [f"# {title}"]
     if authors:
         lines.append(f"**Author:** {authors}")
+    if style_header_lines:
+        lines.append("")
+        lines.extend(style_header_lines)
     lines.append("")
 
     for section_title, section_text in sections:
@@ -718,6 +902,18 @@ def main() -> int:
         action="store_true",
         help="Extract all manifest images, not just those referenced in content.",
     )
+    parser.add_argument(
+        "--markdown-mode",
+        choices=["plain", "rich"],
+        default="plain",
+        help="Markdown conversion style (plain or rich).",
+    )
+    parser.add_argument(
+        "--style",
+        choices=["inline", "external"],
+        default="inline",
+        help="CSS handling for rich mode (inline or external).",
+    )
     args = parser.parse_args()
 
     epub_paths = sorted(args.input_dir.rglob("*.epub"))
@@ -728,7 +924,13 @@ def main() -> int:
     failures = 0
     for epub_path in epub_paths:
         try:
-            output_path = parse_epub(epub_path, args.output_dir, media_all=args.media_all)
+            output_path = parse_epub(
+                epub_path,
+                args.output_dir,
+                media_all=args.media_all,
+                markdown_mode=args.markdown_mode,
+                style_mode=args.style,
+            )
         except Exception as exc:
             failures += 1
             print(f"Failed to parse {epub_path.name}: {exc}")
