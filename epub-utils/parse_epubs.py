@@ -53,15 +53,22 @@ class _HtmlToMarkdown(HTMLParser):
         "blockquote",
     }
     HEADING_TAGS = _HEADING_TAGS
+    IGNORE_TAGS = {"head", "title", "style", "script", "svg"}
 
     def __init__(self) -> None:
         super().__init__()
         self._lines: list[str] = []
         self._heading_level: Optional[int] = None
         self._heading_chunks: list[str] = []
+        self._ignore_depth = 0
 
     def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
         tag = tag.lower()
+        if tag in self.IGNORE_TAGS:
+            self._ignore_depth += 1
+            return
+        if self._ignore_depth:
+            return
         if tag in self.HEADING_TAGS:
             self._heading_level = int(tag[1])
             self._heading_chunks = []
@@ -72,6 +79,12 @@ class _HtmlToMarkdown(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
         tag = tag.lower()
+        if tag in self.IGNORE_TAGS:
+            if self._ignore_depth:
+                self._ignore_depth -= 1
+            return
+        if self._ignore_depth:
+            return
         if tag in self.HEADING_TAGS:
             heading_text = " ".join(self._heading_chunks).strip()
             if heading_text:
@@ -85,6 +98,8 @@ class _HtmlToMarkdown(HTMLParser):
             self._ensure_blank_line()
 
     def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._ignore_depth:
+            return
         text = data.strip()
         if not text:
             return
@@ -98,6 +113,13 @@ class _HtmlToMarkdown(HTMLParser):
             self._lines.append(text)
         else:
             self._lines[-1] = self._lines[-1].rstrip() + " " + text
+
+    def handle_startendtag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        tag = tag.lower()
+        if tag in self.IGNORE_TAGS or self._ignore_depth:
+            return
+        if tag in self.BLOCK_TAGS:
+            self._ensure_blank_line()
 
     def _ensure_blank_line(self) -> None:
         if not self._lines:
@@ -304,6 +326,10 @@ def _extract_section_markdown(
 
 
 def _render_full_markdown(content: ContentData) -> str:
+    if content.tree is not None:
+        body_nodes = content.tree.xpath('//*[local-name()="body"]')
+        if body_nodes:
+            return _render_markdown(_nodes_to_html(body_nodes))
     return _render_markdown(content.xml)
 
 
