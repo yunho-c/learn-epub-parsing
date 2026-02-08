@@ -443,6 +443,136 @@ def _extract_section_markdown(
     return _render_markdown(_nodes_to_html(nodes), image_resolver=image_resolver)
 
 
+def _find_body_node(tree: Optional[etree._Element]) -> Optional[etree._Element]:
+    if tree is None:
+        return None
+    body_nodes = tree.xpath('//*[local-name()="body"]')
+    if not body_nodes:
+        return None
+    return body_nodes[0]
+
+
+def _top_level_body_child(
+    body: etree._Element, node: etree._Element
+) -> Optional[etree._Element]:
+    current = node
+    while current is not None:
+        parent = current.getparent()
+        if parent is body:
+            return current
+        if parent is None:
+            return None
+        current = parent
+    return None
+
+
+def _render_nodes_markdown(
+    nodes: list[etree._Element],
+    markdown_mode: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+) -> str:
+    if not nodes:
+        return ""
+    if markdown_mode == "rich":
+        return _render_rich_from_nodes(nodes, image_resolver=image_resolver)
+    return _render_markdown(_nodes_to_html(nodes), image_resolver=image_resolver)
+
+
+def _extract_fragment_span_markdown(
+    content: ContentData,
+    start_fragment: str,
+    markdown_mode: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    end_fragment: Optional[str] = None,
+) -> Optional[str]:
+    body = _find_body_node(content.tree)
+    if body is None:
+        return None
+    start_anchor = _find_anchor_node(content.tree, start_fragment)
+    if start_anchor is None:
+        return None
+
+    children = list(body)
+    if not children:
+        return None
+
+    start_top = _top_level_body_child(body, start_anchor)
+    if start_top is None:
+        return None
+    try:
+        start_idx = children.index(start_top)
+    except ValueError:
+        return None
+
+    end_idx = len(children)
+    if end_fragment:
+        end_anchor = _find_anchor_node(content.tree, end_fragment)
+        if end_anchor is not None:
+            end_top = _top_level_body_child(body, end_anchor)
+            if end_top is not None:
+                try:
+                    candidate = children.index(end_top)
+                except ValueError:
+                    candidate = end_idx
+                if candidate > start_idx:
+                    end_idx = candidate
+
+    nodes = children[start_idx:end_idx]
+    if not nodes:
+        return None
+
+    text = _render_nodes_markdown(
+        nodes, markdown_mode=markdown_mode, image_resolver=image_resolver
+    )
+    return text if text else None
+
+
+def _extract_from_fragment_markdown(
+    content: ContentData,
+    start_fragment: str,
+    markdown_mode: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+) -> Optional[str]:
+    return _extract_fragment_span_markdown(
+        content,
+        start_fragment=start_fragment,
+        markdown_mode=markdown_mode,
+        image_resolver=image_resolver,
+        end_fragment=None,
+    )
+
+
+def _extract_until_fragment_markdown(
+    content: ContentData,
+    end_fragment: str,
+    markdown_mode: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+) -> Optional[str]:
+    body = _find_body_node(content.tree)
+    if body is None:
+        return None
+    end_anchor = _find_anchor_node(content.tree, end_fragment)
+    if end_anchor is None:
+        return None
+    children = list(body)
+    if not children:
+        return None
+    end_top = _top_level_body_child(body, end_anchor)
+    if end_top is None:
+        return None
+    try:
+        end_idx = children.index(end_top)
+    except ValueError:
+        return None
+    nodes = children[:end_idx]
+    if not nodes:
+        return None
+    text = _render_nodes_markdown(
+        nodes, markdown_mode=markdown_mode, image_resolver=image_resolver
+    )
+    return text if text else None
+
+
 def _render_full_markdown(
     content: ContentData, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
 ) -> str:
@@ -451,6 +581,16 @@ def _render_full_markdown(
         if body_nodes:
             return _render_markdown(_nodes_to_html(body_nodes), image_resolver=image_resolver)
     return _render_markdown(content.xml, image_resolver=image_resolver)
+
+
+def _render_full_for_mode(
+    content: ContentData,
+    markdown_mode: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+) -> str:
+    if markdown_mode == "rich":
+        return _render_full_rich_markdown(content, image_resolver=image_resolver)
+    return _render_full_markdown(content, image_resolver=image_resolver)
 
 
 def _render_rich_from_nodes(
@@ -634,6 +774,7 @@ def parse_epub(
 
     spine_hrefs_set = {href for _, href in spine_entries}
     spine_href_to_idref = {href: content_id for content_id, href in spine_entries}
+    spine_index_by_href = {href: idx for idx, (_, href) in enumerate(spine_entries)}
     toc_entries = _build_toc_entries(doc, manifest_by_href, spine_hrefs_set)
 
     content_cache: dict[str, ContentData] = {}
@@ -736,72 +877,90 @@ def parse_epub(
                 if style_text:
                     inline_styles.append(style_text)
 
+        def render_partial_content(
+            content_data: ContentData,
+            start_fragment: Optional[str],
+            end_fragment: Optional[str],
+        ) -> Optional[str]:
+            image_resolver = make_image_resolver(content_data.href)
+            if start_fragment and end_fragment:
+                return _extract_fragment_span_markdown(
+                    content_data,
+                    start_fragment=start_fragment,
+                    end_fragment=end_fragment,
+                    markdown_mode=markdown_mode,
+                    image_resolver=image_resolver,
+                )
+            if start_fragment:
+                return _extract_from_fragment_markdown(
+                    content_data,
+                    start_fragment=start_fragment,
+                    markdown_mode=markdown_mode,
+                    image_resolver=image_resolver,
+                )
+            if end_fragment:
+                return _extract_until_fragment_markdown(
+                    content_data,
+                    end_fragment=end_fragment,
+                    markdown_mode=markdown_mode,
+                    image_resolver=image_resolver,
+                )
+            return _render_full_for_mode(
+                content_data,
+                markdown_mode=markdown_mode,
+                image_resolver=image_resolver,
+            )
+
         if toc_entries:
-            sections_by_entry: list[Optional[tuple[str, str]]] = [None] * len(toc_entries)
-            href_counts: dict[str, int] = {}
-            for entry in toc_entries:
-                href_counts[entry.href] = href_counts.get(entry.href, 0) + 1
-            href_has_section = {href: False for href in href_counts}
-            first_index_by_href: dict[str, int] = {}
-            seen_texts_by_href: dict[str, set[str]] = {
-                href: set() for href in href_counts
-            }
-
             for idx, entry in enumerate(toc_entries):
-                first_index_by_href.setdefault(entry.href, idx)
-                content_data = get_content_data(entry.href)
-                if content_data is None:
+                start_idx = spine_index_by_href.get(entry.href)
+                if start_idx is None:
                     continue
-                record_css_for_content(content_data)
-                image_resolver = make_image_resolver(content_data.href)
-                allow_body = href_counts[entry.href] == 1
-                text = None
-                if entry.fragment:
-                    text = _extract_section_markdown(
-                        content_data,
-                        entry.fragment,
-                        allow_body=allow_body,
-                        image_resolver=image_resolver,
-                        markdown_mode=markdown_mode,
-                    )
-                elif allow_body:
-                    if markdown_mode == "rich":
-                        text = _render_full_rich_markdown(
-                            content_data, image_resolver=image_resolver
-                        )
-                    else:
-                        text = _render_full_markdown(
-                            content_data, image_resolver=image_resolver
-                        )
-                if text:
-                    if text in seen_texts_by_href[entry.href]:
-                        continue
-                    seen_texts_by_href[entry.href].add(text)
-                    sections_by_entry[idx] = (entry.label, text)
-                    href_has_section[entry.href] = True
 
-            for href, has_section in href_has_section.items():
-                if has_section:
-                    continue
-                first_index = first_index_by_href.get(href)
-                if first_index is None:
-                    continue
-                content_data = get_content_data(href)
-                if content_data is None:
-                    continue
-                record_css_for_content(content_data)
-                image_resolver = make_image_resolver(content_data.href)
-                if markdown_mode == "rich":
-                    text = _render_full_rich_markdown(
-                        content_data, image_resolver=image_resolver
-                    )
+                next_entry = toc_entries[idx + 1] if idx + 1 < len(toc_entries) else None
+                end_idx: Optional[int] = None
+                if next_entry is not None:
+                    end_idx = spine_index_by_href.get(next_entry.href)
+                    if end_idx is None:
+                        end_idx = len(spine_entries) - 1
                 else:
-                    text = _render_full_markdown(content_data, image_resolver=image_resolver)
-                if not text:
+                    end_idx = len(spine_entries) - 1
+                if end_idx < start_idx:
                     continue
-                sections_by_entry[first_index] = (toc_entries[first_index].label, text)
 
-            sections = [section for section in sections_by_entry if section]
+                chunks: list[str] = []
+                for spine_idx in range(start_idx, end_idx + 1):
+                    href = spine_entries[spine_idx][1]
+                    content_data = get_content_data(href)
+                    if content_data is None:
+                        continue
+                    record_css_for_content(content_data)
+
+                    start_fragment = None
+                    end_fragment = None
+                    if spine_idx == start_idx:
+                        start_fragment = entry.fragment
+                    if next_entry is not None and spine_idx == end_idx:
+                        end_fragment = next_entry.fragment
+                        if next_entry.fragment is None and next_entry.href == href:
+                            end_fragment = None
+
+                    if next_entry is not None and spine_idx == end_idx:
+                        if next_entry.fragment is None:
+                            # Next section starts at the beginning of this file.
+                            continue
+
+                    part = render_partial_content(
+                        content_data,
+                        start_fragment=start_fragment,
+                        end_fragment=end_fragment,
+                    )
+                    if part:
+                        chunks.append(part)
+
+                text = _normalize_text("\n\n".join(chunks))
+                if text:
+                    sections.append((entry.label, text))
         else:
             for _, href in spine_entries:
                 content_data = get_content_data(href)
@@ -809,12 +968,9 @@ def parse_epub(
                     continue
                 record_css_for_content(content_data)
                 image_resolver = make_image_resolver(content_data.href)
-                if markdown_mode == "rich":
-                    text = _render_full_rich_markdown(
-                        content_data, image_resolver=image_resolver
-                    )
-                else:
-                    text = _render_full_markdown(content_data, image_resolver=image_resolver)
+                text = _render_full_for_mode(
+                    content_data, markdown_mode=markdown_mode, image_resolver=image_resolver
+                )
                 if not text:
                     continue
                 sections.append((_prettify_section_name(href), text))
@@ -867,6 +1023,8 @@ def parse_epub(
     base_lines.append("")
 
     if split_chapters:
+        for stale in output_root.glob("*.md"):
+            stale.unlink()
         width = max(2, len(str(len(sections))))
         for index, (section_title, section_text) in enumerate(sections, start=1):
             if section_title.strip():
