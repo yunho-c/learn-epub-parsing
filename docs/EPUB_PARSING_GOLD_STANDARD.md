@@ -71,6 +71,15 @@ If TOC is unavailable:
 
 - Fallback to spine order, one section per spine document.
 
+Optional heading fallback (`--chapter-fallback auto|force`):
+
+- Used for low-quality EPUBs where TOC is degenerate.
+- In `auto`, fallback is attempted only when:
+  - `toc_entry_count <= 1`, OR
+  - `unique_toc_hrefs < 3`, OR
+  - `toc_coverage_ratio < 0.15`.
+- In `force`, fallback is always attempted first.
+
 ## 4) Partial slicing model inside an XHTML document
 
 When a fragment is involved:
@@ -177,6 +186,7 @@ Common controls used by both implementations:
 - `--markdown-mode plain|rich`
 - `--style inline|external`
 - `--split-chapters`
+- `--chapter-fallback off|auto|force`
 
 ## 11) Architecture parity in this repo
 
@@ -246,6 +256,7 @@ When reproducing this in mobile, validate against this repo outputs:
 5. Rich mode preserves tables/figures/classed content.
 6. Plain mode excludes `head/title/style/script/svg` leakage.
 7. Results remain stable across repeated runs.
+8. Heading fallback (`auto`) activates on degenerate TOC books (for example Internet Archive OCR EPUBs) and emits activation warnings.
 
 ## 14) Known tradeoffs
 

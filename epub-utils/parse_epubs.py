@@ -31,6 +31,17 @@ _COMPLEX_HTML_TAGS = {
     "svg",
     "math",
 }
+_MAJOR_HEADING_RE = re.compile(
+    r"\b(?:chapter|book|part)\s+(?:[ivxlcdm]+|\d+)\b|\b(?:preface|prologue|epilogue|introduction|foreword|afterword)\b",
+    re.IGNORECASE,
+)
+_MAJOR_HEADING_LABEL_RE = re.compile(
+    r"\b(?:chapter|book|part)\s+(?:[ivxlcdm]+|\d+)(?:\s*[:.-]?\s*[a-z0-9][a-z0-9' -]{0,70})?|\b(?:preface|prologue|epilogue|introduction|foreword|afterword)\b",
+    re.IGNORECASE,
+)
+_OCR_NOISE_RE = re.compile(
+    r"estimated\s+to\s+be\s+only\s+\d+(?:\.\d+)?%\s+accurate", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,14 @@ class ContentData:
     href: str
     xml: str
     tree: Optional[etree._Element]
+
+
+@dataclass(frozen=True)
+class HeadingCandidate:
+    spine_idx: int
+    score: float
+    label: str
+    true_heading: bool
 
 
 class _HtmlToMarkdown(HTMLParser):
@@ -728,6 +747,160 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clean_heading_label(text: str) -> str:
+    cleaned = _normalize_space(text)
+    cleaned = re.sub(r"^[^\w]+|[^\w]+$", "", cleaned)
+    return cleaned
+
+
+def _extract_major_heading_label(text: str) -> str:
+    match = _MAJOR_HEADING_LABEL_RE.search(text)
+    if not match:
+        return ""
+    return _clean_heading_label(match.group(0))
+
+
+def _is_heading_like_line(text: str) -> bool:
+    line = _normalize_space(text)
+    if not line or len(line) > 80:
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]*", line)
+    if not words:
+        return False
+    letters = [c for c in line if c.isalpha()]
+    if not letters:
+        return False
+    all_caps = all(not c.islower() for c in letters)
+    title_case_like = sum(1 for word in words if word[0].isupper()) >= max(
+        1, int(len(words) * 0.8)
+    )
+    return all_caps or title_case_like
+
+
+def _extract_heading_features(content: ContentData) -> tuple[str, str, list[str]]:
+    if content.tree is None:
+        return "", "", []
+    body = _find_body_node(content.tree)
+    if body is None:
+        return "", "", []
+
+    body_text = etree.tostring(body, method="text", encoding="unicode")
+    top_window_raw = body_text[:1500]
+    top_window_text = _normalize_space(top_window_raw)
+
+    first_nonempty_line = ""
+    for line in top_window_raw.splitlines():
+        stripped = _normalize_space(line)
+        if stripped:
+            first_nonempty_line = stripped
+            break
+    if not first_nonempty_line and top_window_text:
+        first_nonempty_line = top_window_text[:80].strip()
+
+    heading_texts: list[str] = []
+    heading_nodes = body.xpath(
+        './/*[local-name()="h1" or local-name()="h2" or local-name()="h3"]'
+    )
+    for heading_node in heading_nodes:
+        heading_text = _normalize_space("".join(heading_node.itertext()))
+        if heading_text:
+            heading_texts.append(heading_text)
+
+    return top_window_text, first_nonempty_line, heading_texts
+
+
+def _score_heading_candidate(content: ContentData) -> tuple[float, str, bool]:
+    top_window_text, first_nonempty_line, heading_texts = _extract_heading_features(content)
+
+    score = 0.0
+    label = ""
+    heading_match = False
+
+    for heading_text in heading_texts:
+        if _MAJOR_HEADING_RE.search(heading_text):
+            score += 0.9
+            heading_match = True
+            label = _extract_major_heading_label(heading_text) or _clean_heading_label(
+                heading_text[:80]
+            )
+            break
+
+    top_match = _MAJOR_HEADING_RE.search(top_window_text)
+    if top_match:
+        score += 0.8
+        if not label:
+            if first_nonempty_line and _MAJOR_HEADING_RE.search(first_nonempty_line):
+                label = _extract_major_heading_label(first_nonempty_line) or _clean_heading_label(
+                    first_nonempty_line[:80]
+                )
+            else:
+                label = _extract_major_heading_label(top_window_text) or _clean_heading_label(
+                    top_match.group(0)
+                )
+
+    first_line_major_match = bool(
+        first_nonempty_line and _MAJOR_HEADING_RE.search(first_nonempty_line)
+    )
+    if first_nonempty_line and (_is_heading_like_line(first_nonempty_line) or first_line_major_match):
+        score += 0.4
+        if not label and first_line_major_match:
+            label = _extract_major_heading_label(first_nonempty_line) or _clean_heading_label(
+                first_nonempty_line[:80]
+            )
+
+    if _OCR_NOISE_RE.search(top_window_text):
+        score -= 0.5
+
+    score = max(0.0, min(2.0, score))
+    true_heading = heading_match or bool(top_match)
+    return score, label, true_heading
+
+
+def _detect_heading_candidates(
+    spine_entries: list[tuple[str, str]],
+    get_content_data: Callable[[str], Optional[ContentData]],
+) -> list[HeadingCandidate]:
+    accepted: list[HeadingCandidate] = []
+    min_gap_docs = 2
+
+    for idx, (_, href) in enumerate(spine_entries):
+        content_data = get_content_data(href)
+        if content_data is None:
+            continue
+        score, label, true_heading = _score_heading_candidate(content_data)
+        if score < 1.0:
+            continue
+        if idx == 0 and not true_heading:
+            continue
+        candidate = HeadingCandidate(
+            spine_idx=idx, score=score, label=_clean_heading_label(label), true_heading=true_heading
+        )
+        if accepted and idx - accepted[-1].spine_idx < min_gap_docs:
+            if candidate.score > accepted[-1].score:
+                accepted[-1] = candidate
+            continue
+        accepted.append(candidate)
+
+    return accepted
+
+
+def _is_toc_degenerate(
+    toc_entries: list[TocEntry], spine_entry_count: int
+) -> tuple[bool, int, int, float]:
+    toc_entry_count = len(toc_entries)
+    unique_toc_hrefs = {entry.href for entry in toc_entries}
+    unique_count = len(unique_toc_hrefs)
+    coverage_ratio = (unique_count / spine_entry_count) if spine_entry_count else 0.0
+    is_degenerate = (
+        toc_entry_count <= 1 or unique_count < 3 or coverage_ratio < 0.15
+    )
+    return is_degenerate, toc_entry_count, unique_count, coverage_ratio
+
+
 def parse_epub(
     epub_path: Path,
     output_dir: Path,
@@ -735,6 +908,7 @@ def parse_epub(
     markdown_mode: str = "plain",
     style_mode: str = "inline",
     split_chapters: bool = False,
+    chapter_fallback: str = "auto",
 ) -> Optional[Path]:
     doc = Document(str(epub_path))
     metadata = doc.package.metadata
@@ -776,6 +950,9 @@ def parse_epub(
     spine_href_to_idref = {href: content_id for content_id, href in spine_entries}
     spine_index_by_href = {href: idx for idx, (_, href) in enumerate(spine_entries)}
     toc_entries = _build_toc_entries(doc, manifest_by_href, spine_hrefs_set)
+    toc_is_degenerate, toc_entry_count, toc_unique_count, toc_coverage_ratio = _is_toc_degenerate(
+        toc_entries, len(spine_entries)
+    )
 
     content_cache: dict[str, ContentData] = {}
 
@@ -911,7 +1088,75 @@ def parse_epub(
                 image_resolver=image_resolver,
             )
 
-        if toc_entries:
+        use_heading_fallback = False
+        attempt_heading_fallback = False
+        if chapter_fallback == "auto":
+            if toc_is_degenerate:
+                attempt_heading_fallback = True
+            else:
+                print(
+                    f"Warning: heading fallback skipped for {title}: TOC not degenerate "
+                    f"(entries={toc_entry_count}, unique_hrefs={toc_unique_count}, "
+                    f"coverage={toc_coverage_ratio:.2f})."
+                )
+        elif chapter_fallback == "force":
+            attempt_heading_fallback = True
+
+        if attempt_heading_fallback:
+            heading_candidates = _detect_heading_candidates(spine_entries, get_content_data)
+            confident_candidates = [candidate for candidate in heading_candidates if candidate.spine_idx > 0]
+            if confident_candidates:
+                starts: list[tuple[int, str]] = []
+                first_label = (
+                    toc_entries[0].label
+                    if toc_entries and toc_entries[0].label.strip()
+                    else _prettify_section_name(spine_entries[0][1])
+                )
+                starts.append((0, first_label))
+                for candidate in confident_candidates:
+                    label = candidate.label or f"Section {len(starts) + 1}"
+                    starts.append((candidate.spine_idx, label))
+
+                print(
+                    f"Warning: using heading fallback for {title} "
+                    f"(mode={chapter_fallback}, toc_entries={toc_entry_count}, "
+                    f"spine_docs={len(spine_entries)}, detected_starts={len(confident_candidates)})."
+                )
+                use_heading_fallback = True
+
+                for start_index, (start_idx, section_label) in enumerate(starts):
+                    next_start = (
+                        starts[start_index + 1][0]
+                        if start_index + 1 < len(starts)
+                        else len(spine_entries)
+                    )
+                    end_idx = next_start - 1
+                    if end_idx < start_idx:
+                        continue
+                    chunks: list[str] = []
+                    for spine_idx in range(start_idx, end_idx + 1):
+                        href = spine_entries[spine_idx][1]
+                        content_data = get_content_data(href)
+                        if content_data is None:
+                            continue
+                        record_css_for_content(content_data)
+                        image_resolver = make_image_resolver(content_data.href)
+                        part = _render_full_for_mode(
+                            content_data,
+                            markdown_mode=markdown_mode,
+                            image_resolver=image_resolver,
+                        )
+                        if part:
+                            chunks.append(part)
+                    text = _normalize_text("\n\n".join(chunks))
+                    if text:
+                        sections.append((section_label, text))
+            else:
+                print(
+                    f"Warning: heading fallback skipped for {title}: insufficient heading confidence."
+                )
+
+        if not use_heading_fallback and toc_entries:
             for idx, entry in enumerate(toc_entries):
                 start_idx = spine_index_by_href.get(entry.href)
                 if start_idx is None:
@@ -961,7 +1206,7 @@ def parse_epub(
                 text = _normalize_text("\n\n".join(chunks))
                 if text:
                     sections.append((entry.label, text))
-        else:
+        elif not use_heading_fallback:
             for _, href in spine_entries:
                 content_data = get_content_data(href)
                 if content_data is None:
@@ -1031,6 +1276,7 @@ def parse_epub(
                 section_slug = _slugify(section_title)
             else:
                 section_slug = f"section_{index:0{width}d}"
+            section_slug = section_slug[:80].strip("_.-") or f"section_{index:0{width}d}"
             filename = f"{index:0{width}d}_{section_slug}.md"
             lines = list(base_lines)
             lines.append(f"## {section_title}")
@@ -1097,6 +1343,12 @@ def main() -> int:
         action="store_true",
         help="Write one Markdown file per chapter under the book slug directory.",
     )
+    parser.add_argument(
+        "--chapter-fallback",
+        choices=["off", "auto", "force"],
+        default="auto",
+        help="Fallback chapter splitting mode based on heading confidence.",
+    )
     args = parser.parse_args()
 
     epub_paths = sorted(args.input_dir.rglob("*.epub"))
@@ -1114,6 +1366,7 @@ def main() -> int:
                 markdown_mode=args.markdown_mode,
                 style_mode=args.style,
                 split_chapters=args.split_chapters,
+                chapter_fallback=args.chapter_fallback,
             )
         except Exception as exc:
             failures += 1

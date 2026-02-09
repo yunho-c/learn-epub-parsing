@@ -14,6 +14,7 @@ This repo provides a small, opinionated pipeline for turning EPUBs into Markdown
    - If the TOC provides anchors (for example `chapter.xhtml#ch1`), content is sliced to that section.
    - If the TOC only references files, the full file is used once per entry.
    - If there is no TOC, fall back to the spine order.
+   - Optional heading fallback (`--chapter-fallback auto|force`) can synthesize section starts from heading-like patterns when TOC quality is poor.
 
 3. **HTML handling**
    - The converter ignores `head`, `title`, `style`, `script`, and `svg` by default so those do not leak into text output.
@@ -82,3 +83,19 @@ python3 epub-utils/parse_epubs.py --markdown-mode rich --style external
 - `--media-all`: extract all manifest images
 - `--markdown-mode`: `plain` or `rich`
 - `--style`: `inline` or `external` (only used in rich mode)
+- `--split-chapters`: write one file per section under `results/<book_slug>/`
+- `--chapter-fallback`: `off|auto|force`
+  - `off`: use TOC/spine logic only
+  - `auto`: only trigger fallback if TOC is degenerate (`entries <= 1` OR `unique_hrefs < 3` OR coverage `< 0.15`)
+  - `force`: always attempt heading-based fallback first
+
+## Heading fallback behavior
+
+- The fallback scores each spine document as a possible chapter start using:
+  - major heading regex hits (`chapter|book|part`, plus `preface|prologue|epilogue|introduction|foreword|afterword`)
+  - heading tags (`h1`..`h3`) and top-of-document text
+  - heading-like short first-line signals
+  - OCR-noise penalty (`estimated to be only XX% accurate`)
+- It accepts starts at confidence `>= 1.0` with minimum spacing between starts to reduce over-splitting.
+- If fallback is requested but not used, a warning is printed with the reason.
+- If fallback activates, a warning is printed with TOC/spine stats and detected start count.

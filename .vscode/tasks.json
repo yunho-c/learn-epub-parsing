@@ -1,0 +1,91 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "EPUB Utils: Convert (plain)",
+      "type": "shell",
+      "command": "pixi",
+      "args": [
+        "run",
+        "python",
+        "epub-utils/parse_epubs.py",
+        "--input-dir",
+        "assets",
+        "--output-dir",
+        "epub-utils/results"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "EPUB Utils: Convert (rich + split + media-all)",
+      "type": "shell",
+      "command": "pixi",
+      "args": [
+        "run",
+        "python",
+        "epub-utils/parse_epubs.py",
+        "--input-dir",
+        "assets",
+        "--output-dir",
+        "epub-utils/results",
+        "--markdown-mode",
+        "rich",
+        "--style",
+        "inline",
+        "--media-all",
+        "--split-chapters"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "RBook Utils: Convert (plain)",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "rbook-utils/Cargo.toml",
+        "--",
+        "--input-dir",
+        "assets",
+        "--output-dir",
+        "rbook-utils/results"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "RBook Utils: Convert (rich + split + media-all)",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "rbook-utils/Cargo.toml",
+        "--",
+        "--input-dir",
+        "assets",
+        "--output-dir",
+        "rbook-utils/results",
+        "--markdown-mode",
+        "rich",
+        "--style",
+        "inline",
+        "--media-all",
+        "--split-chapters"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
