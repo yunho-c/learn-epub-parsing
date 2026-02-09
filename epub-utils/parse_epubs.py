@@ -972,6 +972,8 @@ def parse_epub(
     sections: list[tuple[str, str]] = []
 
     image_output_root = output_dir / book_slug / "images"
+    image_link_prefix = "./images" if split_chapters else f"./{book_slug}/images"
+    style_link_prefix = "./styles" if split_chapters else f"./{book_slug}/styles"
     extracted_images: dict[str, str] = {}
     extracted_count = 0
 
@@ -991,7 +993,7 @@ def parse_epub(
             if not _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
                 print(f"Warning: missing media '{href}' in {epub_path.name}")
                 return None
-            rel_path = f"./{book_slug}/images/{href}"
+            rel_path = f"{image_link_prefix}/{href}"
             extracted_images[href] = rel_path
             extracted_count += 1
             return rel_path
@@ -1227,7 +1229,7 @@ def parse_epub(
                     zip_path = posixpath.join(doc.package_href, href)
                     output_path = styles_root / href
                     if _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
-                        rel_path = f"./{book_slug}/styles/{href}"
+                        rel_path = f"{style_link_prefix}/{href}"
                         style_header_lines.append(
                             f'<link rel="stylesheet" href="{rel_path}">'
                         )
@@ -1238,7 +1240,7 @@ def parse_epub(
                         "\n\n".join(inline_styles).strip() + "\n", encoding="utf-8"
                     )
                     style_header_lines.append(
-                        f'<link rel="stylesheet" href="./{book_slug}/styles/inline_styles.css">'
+                        f'<link rel="stylesheet" href="{style_link_prefix}/inline_styles.css">'
                     )
             else:
                 css_chunks: list[str] = []
