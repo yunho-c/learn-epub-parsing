@@ -26,7 +26,7 @@ This repo provides a small, opinionated pipeline for turning EPUBs into Markdown
    - `<img>` tags are converted to Markdown images.
    - Image files are extracted from the EPUB and written to `epub-utils/results/<book_slug>/images/...`.
    - Links in Markdown use relative paths like `./<book_slug>/images/...`.
-   - Optional `--media-all` extracts all manifest images, not just those referenced in content.
+   - Optional `--media-all` extracts all manifest images, plus audio/video when present in the manifest.
 
 5. **CSS handling (rich mode only)**
    - Only CSS linked by the XHTML being processed is considered.
@@ -34,11 +34,27 @@ This repo provides a small, opinionated pipeline for turning EPUBs into Markdown
      - `--style inline`: embed CSS in a `<style>` block at the top of the Markdown.
      - `--style external`: copy CSS to `epub-utils/results/<book_slug>/styles/...` and insert `<link>` tags.
 
+6. **Post-processing and reports**
+   - Internal links are rewritten for split/single output and validated.
+   - Optional note handling mode:
+     - `--notes-mode inline|chapter-end|global`
+   - Optional machine-readable exports:
+     - `--export-manifest v1` writes `results/<book_slug>/manifest.v1.json`
+     - `--quality-report v1` writes `results/<book_slug>/report.v1.json`
+   - Optional cleanup controls:
+     - `--nav-cleanup off|auto` (TOC dedupe/noise suppression)
+     - `--ocr-cleanup off|basic|aggressive`
+   - Optional deterministic split naming:
+     - `--filename-scheme legacy|stable`
+
 ## Output layout
 
 - Markdown files: `epub-utils/results/<book_slug>.md`
+- Split chapters: `epub-utils/results/<book_slug>/<chapter>.md`
 - Images: `epub-utils/results/<book_slug>/images/...`
+- Media (audio/video when extracted): `epub-utils/results/<book_slug>/media/...`
 - Styles (rich mode + external): `epub-utils/results/<book_slug>/styles/...`
+- Manifest/report exports: `epub-utils/results/<book_slug>/manifest.v1.json`, `epub-utils/results/<book_slug>/report.v1.json`
 
 ## Script location
 
@@ -88,6 +104,12 @@ python3 epub-utils/parse_epubs.py --markdown-mode rich --style external
   - `off`: use TOC/spine logic only
   - `auto`: only trigger fallback if TOC is degenerate (`entries <= 1` OR `unique_hrefs < 3` OR coverage `< 0.15`)
   - `force`: always attempt heading-based fallback first
+- `--notes-mode`: `inline|chapter-end|global`
+- `--export-manifest`: `off|v1`
+- `--quality-report`: `off|v1`
+- `--ocr-cleanup`: `off|basic|aggressive`
+- `--nav-cleanup`: `off|auto`
+- `--filename-scheme`: `legacy|stable`
 
 ## Heading fallback behavior
 

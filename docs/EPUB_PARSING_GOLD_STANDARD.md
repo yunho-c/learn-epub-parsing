@@ -164,9 +164,22 @@ Then sections:
 Split mode (`--split-chapters`):
 
 - Write one chapter file per section:
-  - `<NN>_<section_slug>.md`
+  - `legacy`: `<NN>_<section_slug>.md`
+  - `stable`: `<section_id>_<section_slug>.md`
 - Place under `results/<book_slug>/`.
 - Before writing, remove stale `*.md` in that folder to avoid old/new mixed outputs.
+
+Post-processing:
+
+- Internal link rewrite/validation for split and single-file output.
+- Optional note handling:
+  - `--notes-mode inline|chapter-end|global`
+- Optional JSON exports:
+  - `manifest.v1.json` via `--export-manifest v1`
+  - `report.v1.json` via `--quality-report v1`
+- Optional cleanup:
+  - `--nav-cleanup off|auto`
+  - `--ocr-cleanup off|basic|aggressive`
 
 ## 9) Determinism and safety behaviors
 
@@ -187,6 +200,12 @@ Common controls used by both implementations:
 - `--style inline|external`
 - `--split-chapters`
 - `--chapter-fallback off|auto|force`
+- `--notes-mode inline|chapter-end|global`
+- `--export-manifest off|v1`
+- `--quality-report off|v1`
+- `--ocr-cleanup off|basic|aggressive`
+- `--nav-cleanup off|auto`
+- `--filename-scheme legacy|stable`
 
 ## 11) Architecture parity in this repo
 
@@ -219,9 +238,15 @@ Recommended module split:
 5. `Renderer`
    - plain/rich modes + image rewriting hooks
 6. `AssetExtractor`
-   - dedup extraction of images/styles
+   - dedup extraction of images/styles/media
 7. `OutputWriter`
    - single-file or split chapters + stale chapter cleanup
+8. `LinkPlanner`
+   - internal href rewrite + unresolved target validation
+9. `NotesPlanner`
+   - `inline`, `chapter-end`, `global` note placement with stable IDs
+10. `ReportEmitter`
+   - `manifest.v1.json` + `report.v1.json`
 
 ### Minimal pseudocode
 
@@ -243,6 +268,8 @@ for boundary in boundaries:
 
 emit_css(mode, style_mode, css_collector)
 write_output(single_or_split)
+rewrite_internal_links()
+emit_manifest_and_report_if_enabled()
 ```
 
 ## 13) Validation checklist for parity
@@ -257,6 +284,8 @@ When reproducing this in mobile, validate against this repo outputs:
 6. Plain mode excludes `head/title/style/script/svg` leakage.
 7. Results remain stable across repeated runs.
 8. Heading fallback (`auto`) activates on degenerate TOC books (for example Internet Archive OCR EPUBs) and emits activation warnings.
+9. `manifest.v1.json` and `report.v1.json` are deterministic for repeated runs.
+10. Split mode with `--filename-scheme stable` keeps file names stable across TOC label churn.
 
 ## 14) Known tradeoffs
 

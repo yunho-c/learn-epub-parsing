@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import posixpath
 import re
 import zipfile
@@ -10,6 +12,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from epub_utils import Document
 
@@ -42,6 +45,9 @@ _MAJOR_HEADING_LABEL_RE = re.compile(
 _OCR_NOISE_RE = re.compile(
     r"estimated\s+to\s+be\s+only\s+\d+(?:\.\d+)?%\s+accurate", re.IGNORECASE
 )
+_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
+_HTML_HREF_RE = re.compile(r'(<a\b[^>]*?\bhref=")([^"]+)(")', re.IGNORECASE)
+_FOOTNOTE_DEF_RE = re.compile(r"^\[\^([^\]]+)\]:\s*(.*)$")
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,27 @@ class HeadingCandidate:
     true_heading: bool
 
 
+@dataclass
+class SectionRecord:
+    title: str
+    text: str
+    start_href: str
+    start_fragment: Optional[str]
+    end_href: Optional[str]
+    end_fragment: Optional[str]
+    spine_start: int
+    spine_end: int
+    anchors: list[str]
+    section_id: str = ""
+    output_path: str = ""
+
+
+@dataclass
+class LinkValidationResult:
+    rewritten: int = 0
+    unresolved: int = 0
+
+
 class _HtmlToMarkdown(HTMLParser):
     BLOCK_TAGS = {
         "p",
@@ -88,13 +115,21 @@ class _HtmlToMarkdown(HTMLParser):
     HEADING_TAGS = _HEADING_TAGS
     IGNORE_TAGS = {"head", "title", "style", "script", "svg"}
 
-    def __init__(self, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None) -> None:
+    def __init__(
+        self,
+        image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+        link_resolver: Optional[Callable[[str], str]] = None,
+    ) -> None:
         super().__init__()
         self._lines: list[str] = []
         self._heading_level: Optional[int] = None
         self._heading_chunks: list[str] = []
         self._ignore_depth = 0
         self._image_resolver = image_resolver
+        self._link_resolver = link_resolver
+        self._in_link = False
+        self._link_href: Optional[str] = None
+        self._link_chunks: list[str] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
         tag = tag.lower()
@@ -114,6 +149,15 @@ class _HtmlToMarkdown(HTMLParser):
                 self._ensure_blank_line()
                 self._lines.append(f"![{alt}]({resolved})")
                 self._ensure_blank_line()
+            return
+        if tag == "a":
+            attr_map = {key.lower(): value for key, value in attrs}
+            href = attr_map.get("href", "") or ""
+            if self._link_resolver and href:
+                href = self._link_resolver(href)
+            self._in_link = True
+            self._link_href = href or None
+            self._link_chunks = []
             return
         if tag in self.HEADING_TAGS:
             self._heading_level = int(tag[1])
@@ -140,6 +184,28 @@ class _HtmlToMarkdown(HTMLParser):
             self._heading_chunks = []
             self._ensure_blank_line()
             return
+        if tag == "a":
+            label = " ".join(self._link_chunks).strip()
+            href = self._link_href
+            self._in_link = False
+            self._link_chunks = []
+            self._link_href = None
+            if label and href:
+                token = f"[{label}]({href})"
+                if not self._lines:
+                    self._lines.append(token)
+                elif self._lines[-1] == "":
+                    self._lines.append(token)
+                else:
+                    self._lines[-1] = self._lines[-1].rstrip() + " " + token
+            elif label:
+                if not self._lines:
+                    self._lines.append(label)
+                elif self._lines[-1] == "":
+                    self._lines.append(label)
+                else:
+                    self._lines[-1] = self._lines[-1].rstrip() + " " + label
+            return
         if tag in self.BLOCK_TAGS:
             self._ensure_blank_line()
 
@@ -151,6 +217,9 @@ class _HtmlToMarkdown(HTMLParser):
             return
         if self._heading_level is not None:
             self._heading_chunks.append(text)
+            return
+        if self._in_link:
+            self._link_chunks.append(text)
             return
         if not self._lines:
             self._lines.append(text)
@@ -194,9 +263,11 @@ def _looks_like_html(text: str) -> bool:
 
 
 def _html_to_markdown(
-    text: str, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+    text: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
-    parser = _HtmlToMarkdown(image_resolver=image_resolver)
+    parser = _HtmlToMarkdown(image_resolver=image_resolver, link_resolver=link_resolver)
     parser.feed(text)
     return parser.markdown()
 
@@ -435,12 +506,18 @@ def _nodes_to_html(nodes: Iterable[object]) -> str:
 
 
 def _render_markdown(
-    html: str, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+    html: str,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
     if not html.strip():
         return ""
     if _looks_like_html(html):
-        html = _html_to_markdown(html, image_resolver=image_resolver)
+        html = _html_to_markdown(
+            html,
+            image_resolver=image_resolver,
+            link_resolver=link_resolver,
+        )
     return _normalize_text(html)
 
 
@@ -449,6 +526,7 @@ def _extract_section_markdown(
     fragment: str,
     allow_body: bool,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
     markdown_mode: str = "plain",
 ) -> Optional[str]:
     anchor = _find_anchor_node(content.tree, fragment)
@@ -458,8 +536,16 @@ def _extract_section_markdown(
     if not nodes:
         return None
     if markdown_mode == "rich":
-        return _render_rich_from_nodes(nodes, image_resolver=image_resolver)
-    return _render_markdown(_nodes_to_html(nodes), image_resolver=image_resolver)
+        return _render_rich_from_nodes(
+            nodes,
+            image_resolver=image_resolver,
+            link_resolver=link_resolver,
+        )
+    return _render_markdown(
+        _nodes_to_html(nodes),
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
+    )
 
 
 def _find_body_node(tree: Optional[etree._Element]) -> Optional[etree._Element]:
@@ -489,12 +575,21 @@ def _render_nodes_markdown(
     nodes: list[etree._Element],
     markdown_mode: str,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
     if not nodes:
         return ""
     if markdown_mode == "rich":
-        return _render_rich_from_nodes(nodes, image_resolver=image_resolver)
-    return _render_markdown(_nodes_to_html(nodes), image_resolver=image_resolver)
+        return _render_rich_from_nodes(
+            nodes,
+            image_resolver=image_resolver,
+            link_resolver=link_resolver,
+        )
+    return _render_markdown(
+        _nodes_to_html(nodes),
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
+    )
 
 
 def _extract_fragment_span_markdown(
@@ -502,6 +597,7 @@ def _extract_fragment_span_markdown(
     start_fragment: str,
     markdown_mode: str,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
     end_fragment: Optional[str] = None,
 ) -> Optional[str]:
     body = _find_body_node(content.tree)
@@ -541,7 +637,10 @@ def _extract_fragment_span_markdown(
         return None
 
     text = _render_nodes_markdown(
-        nodes, markdown_mode=markdown_mode, image_resolver=image_resolver
+        nodes,
+        markdown_mode=markdown_mode,
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
     )
     return text if text else None
 
@@ -551,12 +650,14 @@ def _extract_from_fragment_markdown(
     start_fragment: str,
     markdown_mode: str,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> Optional[str]:
     return _extract_fragment_span_markdown(
         content,
         start_fragment=start_fragment,
         markdown_mode=markdown_mode,
         image_resolver=image_resolver,
+        link_resolver=link_resolver,
         end_fragment=None,
     )
 
@@ -566,6 +667,7 @@ def _extract_until_fragment_markdown(
     end_fragment: str,
     markdown_mode: str,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> Optional[str]:
     body = _find_body_node(content.tree)
     if body is None:
@@ -587,33 +689,57 @@ def _extract_until_fragment_markdown(
     if not nodes:
         return None
     text = _render_nodes_markdown(
-        nodes, markdown_mode=markdown_mode, image_resolver=image_resolver
+        nodes,
+        markdown_mode=markdown_mode,
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
     )
     return text if text else None
 
 
 def _render_full_markdown(
-    content: ContentData, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+    content: ContentData,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
     if content.tree is not None:
         body_nodes = content.tree.xpath('//*[local-name()="body"]')
         if body_nodes:
-            return _render_markdown(_nodes_to_html(body_nodes), image_resolver=image_resolver)
-    return _render_markdown(content.xml, image_resolver=image_resolver)
+            return _render_markdown(
+                _nodes_to_html(body_nodes),
+                image_resolver=image_resolver,
+                link_resolver=link_resolver,
+            )
+    return _render_markdown(
+        content.xml,
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
+    )
 
 
 def _render_full_for_mode(
     content: ContentData,
     markdown_mode: str,
     image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
     if markdown_mode == "rich":
-        return _render_full_rich_markdown(content, image_resolver=image_resolver)
-    return _render_full_markdown(content, image_resolver=image_resolver)
+        return _render_full_rich_markdown(
+            content,
+            image_resolver=image_resolver,
+            link_resolver=link_resolver,
+        )
+    return _render_full_markdown(
+        content,
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
+    )
 
 
 def _render_rich_from_nodes(
-    nodes: Iterable[object], image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+    nodes: Iterable[object],
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
     chunks: list[str] = []
     for node in nodes:
@@ -622,7 +748,11 @@ def _render_rich_from_nodes(
             chunks.append(etree.tostring(node, encoding="unicode"))
         else:
             html = etree.tostring(node, encoding="unicode")
-            text = _render_markdown(html, image_resolver=image_resolver)
+            text = _render_markdown(
+                html,
+                image_resolver=image_resolver,
+                link_resolver=link_resolver,
+            )
             if text:
                 chunks.append(text)
         if node.tail and node.tail.strip():
@@ -631,18 +761,32 @@ def _render_rich_from_nodes(
 
 
 def _render_full_rich_markdown(
-    content: ContentData, image_resolver: Optional[Callable[[str, str], Optional[str]]] = None
+    content: ContentData,
+    image_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
+    link_resolver: Optional[Callable[[str], str]] = None,
 ) -> str:
     if content.tree is None:
-        return _render_full_markdown(content, image_resolver=image_resolver)
+        return _render_full_markdown(
+            content,
+            image_resolver=image_resolver,
+            link_resolver=link_resolver,
+        )
     body_nodes = content.tree.xpath('//*[local-name()="body"]')
     if not body_nodes:
-        return _render_full_markdown(content, image_resolver=image_resolver)
+        return _render_full_markdown(
+            content,
+            image_resolver=image_resolver,
+            link_resolver=link_resolver,
+        )
     body = body_nodes[0]
     chunks: list[str] = []
     if body.text and body.text.strip():
         chunks.append(body.text.strip())
-    body_chunks = _render_rich_from_nodes(list(body), image_resolver=image_resolver)
+    body_chunks = _render_rich_from_nodes(
+        list(body),
+        image_resolver=image_resolver,
+        link_resolver=link_resolver,
+    )
     if body_chunks:
         chunks.append(body_chunks)
     return _normalize_text("\n\n".join(chunks))
@@ -901,6 +1045,218 @@ def _is_toc_degenerate(
     return is_degenerate, toc_entry_count, unique_count, coverage_ratio
 
 
+def _build_section_id(
+    start_href: str,
+    start_fragment: Optional[str],
+    end_href: Optional[str],
+    end_fragment: Optional[str],
+) -> str:
+    canonical = (
+        f"{start_href}#{start_fragment or ''}|{end_href or ''}#{end_fragment or ''}"
+    )
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def _collect_node_anchors(nodes: Iterable[etree._Element]) -> list[str]:
+    anchors: set[str] = set()
+    for node in nodes:
+        node_id = (node.get("id") or "").strip()
+        if node_id:
+            anchors.add(node_id)
+        node_name = (node.get("name") or "").strip()
+        if node_name:
+            anchors.add(node_name)
+        for child in node.xpath(".//*[@id]"):
+            value = (child.get("id") or "").strip()
+            if value:
+                anchors.add(value)
+        for child in node.xpath('.//*[local-name()="a" and @name]'):
+            value = (child.get("name") or "").strip()
+            if value:
+                anchors.add(value)
+    return sorted(anchors)
+
+
+def _collect_content_anchors(content: ContentData) -> list[str]:
+    if content.tree is None:
+        return []
+    body = _find_body_node(content.tree)
+    if body is None:
+        return []
+    return _collect_node_anchors(list(body))
+
+
+def _cleanup_toc_entries(
+    toc_entries: list[TocEntry], nav_cleanup: str
+) -> tuple[list[TocEntry], int]:
+    if nav_cleanup == "off":
+        return toc_entries, 0
+    cleaned: list[TocEntry] = []
+    seen: set[tuple[str, str, str]] = set()
+    removed = 0
+    for entry in toc_entries:
+        normalized_label = _normalize_space(entry.label).lower()
+        if not normalized_label:
+            removed += 1
+            continue
+        if _OCR_NOISE_RE.search(normalized_label):
+            removed += 1
+            continue
+        key = (entry.href, entry.fragment or "", normalized_label)
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        if cleaned and cleaned[-1].href == entry.href and cleaned[-1].fragment == entry.fragment:
+            removed += 1
+            continue
+        cleaned.append(entry)
+    return cleaned, removed
+
+
+def _clean_line_for_ocr(line: str, aggressive: bool) -> Optional[str]:
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    if _OCR_NOISE_RE.search(stripped):
+        return None
+    if aggressive:
+        total = len(stripped)
+        noise = sum(
+            1
+            for char in stripped
+            if not (char.isalnum() or char.isspace() or char in ".,;:!?'-_()[]\"/")
+        )
+        if total > 12 and (noise / total) > 0.35:
+            return None
+    return line
+
+
+def _apply_ocr_cleanup(text: str, mode: str) -> tuple[str, int]:
+    if mode == "off":
+        return text, 0
+    cleaned = text
+    changes = 0
+    # Soft dehyphenation for line-wrap artifacts.
+    hyphen_fixed = re.sub(r"([A-Za-z])-\n([a-z])", r"\1\2", cleaned)
+    if hyphen_fixed != cleaned:
+        changes += 1
+    cleaned = hyphen_fixed
+    lines = cleaned.splitlines()
+    out: list[str] = []
+    previous_compact = ""
+    aggressive = mode == "aggressive"
+    for line in lines:
+        filtered = _clean_line_for_ocr(line, aggressive)
+        if filtered is None:
+            changes += 1
+            continue
+        compact = _normalize_space(filtered)
+        if compact and compact == previous_compact:
+            changes += 1
+            continue
+        out.append(filtered)
+        if compact:
+            previous_compact = compact
+    cleaned = "\n".join(out)
+    cleaned = _normalize_text(cleaned)
+    return cleaned, changes
+
+
+def _resolve_internal_target(target: str, base_href: str) -> Optional[tuple[str, Optional[str], str]]:
+    stripped = target.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if lowered.startswith(("http://", "https://", "data:", "mailto:", "javascript:")):
+        return None
+    parsed = urlsplit(stripped)
+    if parsed.scheme or parsed.netloc:
+        return None
+    raw_path = parsed.path or ""
+    fragment = parsed.fragment or None
+    query = parsed.query
+    if raw_path:
+        resolved_href = _normalize_href(posixpath.join(posixpath.dirname(base_href), raw_path))
+    else:
+        resolved_href = _normalize_href(base_href)
+    normalized = urlunsplit(("", "", raw_path, query, fragment or ""))
+    return resolved_href, fragment, normalized
+
+
+def _replace_markdown_links(
+    text: str, replace: Callable[[str], tuple[str, bool]]
+) -> tuple[str, LinkValidationResult]:
+    stats = LinkValidationResult()
+
+    def _on_match(match: re.Match[str]) -> str:
+        label = match.group(1)
+        target = match.group(2)
+        replaced, resolved = replace(target)
+        if replaced != target:
+            stats.rewritten += 1
+        if not resolved:
+            stats.unresolved += 1
+        return f"[{label}]({replaced})"
+
+    return _MARKDOWN_LINK_RE.sub(_on_match, text), stats
+
+
+def _replace_html_links(
+    text: str, replace: Callable[[str], tuple[str, bool]]
+) -> tuple[str, LinkValidationResult]:
+    stats = LinkValidationResult()
+
+    def _on_match(match: re.Match[str]) -> str:
+        prefix, href, suffix = match.groups()
+        replaced, resolved = replace(href)
+        if replaced != href:
+            stats.rewritten += 1
+        if not resolved:
+            stats.unresolved += 1
+        return f"{prefix}{replaced}{suffix}"
+
+    return _HTML_HREF_RE.sub(_on_match, text), stats
+
+
+def _extract_markdown_footnotes(text: str) -> tuple[str, dict[str, str]]:
+    lines = text.splitlines()
+    kept: list[str] = []
+    notes: dict[str, str] = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        match = _FOOTNOTE_DEF_RE.match(line)
+        if not match:
+            kept.append(line)
+            i += 1
+            continue
+        note_id = match.group(1)
+        payload_lines = [match.group(2).rstrip()]
+        i += 1
+        while i < len(lines):
+            cont = lines[i]
+            if cont.startswith("    ") or cont.startswith("\t"):
+                payload_lines.append(cont.lstrip())
+                i += 1
+                continue
+            break
+        note_text = "\n".join(part for part in payload_lines if part).strip()
+        if note_text:
+            notes[note_id] = note_text
+    return "\n".join(kept).strip(), notes
+
+
+def _rewrite_note_refs(text: str, id_map: dict[str, str]) -> str:
+    if not id_map:
+        return text
+    return re.sub(
+        r"\[\^([^\]]+)\]",
+        lambda m: f"[^{id_map.get(m.group(1), m.group(1))}]",
+        text,
+    )
+
+
 def parse_epub(
     epub_path: Path,
     output_dir: Path,
@@ -909,12 +1265,27 @@ def parse_epub(
     style_mode: str = "inline",
     split_chapters: bool = False,
     chapter_fallback: str = "auto",
+    notes_mode: str = "inline",
+    export_manifest: str = "off",
+    quality_report: str = "off",
+    ocr_cleanup: str = "off",
+    nav_cleanup: str = "auto",
+    filename_scheme: str = "legacy",
 ) -> Optional[Path]:
     doc = Document(str(epub_path))
     metadata = doc.package.metadata
     title = _get_metadata_title(metadata) or epub_path.stem
     authors = _get_metadata_authors(metadata)
     book_slug = _slugify(title)
+    book_dir = output_dir / book_slug
+
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    def warn(message: str) -> None:
+        full = f"Warning: {message}"
+        print(full)
+        warnings.append(full)
 
     manifest_list = [
         item
@@ -950,6 +1321,7 @@ def parse_epub(
     spine_href_to_idref = {href: content_id for content_id, href in spine_entries}
     spine_index_by_href = {href: idx for idx, (_, href) in enumerate(spine_entries)}
     toc_entries = _build_toc_entries(doc, manifest_by_href, spine_hrefs_set)
+    toc_entries, nav_removed = _cleanup_toc_entries(toc_entries, nav_cleanup)
     toc_is_degenerate, toc_entry_count, toc_unique_count, toc_coverage_ratio = _is_toc_degenerate(
         toc_entries, len(spine_entries)
     )
@@ -964,18 +1336,23 @@ def parse_epub(
             return None
         try:
             data = _load_content(doc, idref, href)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"Failed to load content {href}: {exc}")
             return None
         content_cache[href] = data
         return data
 
-    sections: list[tuple[str, str]] = []
+    sections: list[SectionRecord] = []
 
-    image_output_root = output_dir / book_slug / "images"
+    image_output_root = book_dir / "images"
+    media_output_root = book_dir / "media"
     image_link_prefix = "./images" if split_chapters else f"./{book_slug}/images"
+    media_link_prefix = "./media" if split_chapters else f"./{book_slug}/media"
     style_link_prefix = "./styles" if split_chapters else f"./{book_slug}/styles"
     extracted_images: dict[str, str] = {}
+    extracted_media: dict[str, str] = {}
     extracted_count = 0
+    extracted_media_count = 0
 
     css_hrefs: set[str] = set()
     inline_styles: list[str] = []
@@ -984,48 +1361,66 @@ def parse_epub(
     with zipfile.ZipFile(epub_path, "r") as epub_zip:
         zip_map = _zip_namelist_map(epub_zip)
 
-        def extract_media_href(href: str) -> Optional[str]:
-            nonlocal extracted_count
-            if href in extracted_images:
-                return extracted_images[href]
+        def extract_asset_href(href: str, category: str) -> Optional[str]:
+            nonlocal extracted_count, extracted_media_count
+            if category == "image":
+                cache = extracted_images
+                output_root = image_output_root
+                link_prefix = image_link_prefix
+            else:
+                cache = extracted_media
+                output_root = media_output_root
+                link_prefix = media_link_prefix
+            if href in cache:
+                return cache[href]
             zip_path = posixpath.join(doc.package_href, href)
-            output_path = image_output_root / href
+            output_path = output_root / href
             if not _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
-                print(f"Warning: missing media '{href}' in {epub_path.name}")
+                warn(f"missing media '{href}' in {epub_path.name}")
                 return None
-            rel_path = f"{image_link_prefix}/{href}"
-            extracted_images[href] = rel_path
-            extracted_count += 1
+            rel_path = f"{link_prefix}/{href}"
+            cache[href] = rel_path
+            if category == "image":
+                extracted_count += 1
+            else:
+                extracted_media_count += 1
             return rel_path
 
         if media_all:
             for item in manifest_list:
                 media_type = item.get("media_type") or ""
-                if not media_type.startswith("image/"):
-                    continue
                 href = item.get("href")
                 if not href:
                     continue
                 normalized = _normalize_href(href)
-                extract_media_href(normalized)
+                if media_type.startswith("image/"):
+                    extract_asset_href(normalized, "image")
+                elif media_type.startswith(("audio/", "video/")):
+                    extract_asset_href(normalized, "media")
+
+        def resolve_asset(base_href: str, src: str) -> Optional[str]:
+            if not src or _is_external_src(src):
+                return src or None
+            resolved = _normalize_href(posixpath.join(posixpath.dirname(base_href), src))
+            media_type = (manifest_by_href.get(resolved) or {}).get("media_type", "")
+            if media_type.startswith("image/"):
+                extracted = extract_asset_href(resolved, "image")
+                return extracted or src
+            if media_type.startswith(("audio/", "video/")):
+                if media_all:
+                    extracted = extract_asset_href(resolved, "media")
+                    return extracted or src
+                return src
+            zip_path = posixpath.join(doc.package_href, resolved)
+            if _zip_has(zip_map, zip_path):
+                extracted = extract_asset_href(resolved, "image")
+                return extracted or src
+            return src
 
         def make_image_resolver(base_href: str) -> Callable[[str, str], Optional[str]]:
             def resolve_image(src: str, alt: str) -> Optional[str]:
-                if not src or _is_external_src(src):
-                    return src or None
-                resolved = _normalize_href(
-                    posixpath.join(posixpath.dirname(base_href), src)
-                )
-                manifest_item = manifest_by_href.get(resolved)
-                if manifest_item:
-                    href = resolved
-                else:
-                    zip_path = posixpath.join(doc.package_href, resolved)
-                    if not _zip_has(zip_map, zip_path):
-                        return src
-                    href = resolved
-                extracted = extract_media_href(href)
-                return extracted or src
+                del alt
+                return resolve_asset(base_href, src)
 
             return resolve_image
 
@@ -1045,9 +1440,7 @@ def parse_epub(
                 href = link.get("href") or ""
                 if not href or _is_external_src(href):
                     continue
-                resolved = _normalize_href(
-                    posixpath.join(posixpath.dirname(content_data.href), href)
-                )
+                resolved = _normalize_href(posixpath.join(posixpath.dirname(content_data.href), href))
                 zip_path = posixpath.join(doc.package_href, resolved)
                 if _zip_has(zip_map, zip_path):
                     css_hrefs.add(resolved)
@@ -1060,35 +1453,54 @@ def parse_epub(
             content_data: ContentData,
             start_fragment: Optional[str],
             end_fragment: Optional[str],
-        ) -> Optional[str]:
+        ) -> tuple[Optional[str], list[str]]:
             image_resolver = make_image_resolver(content_data.href)
-            if start_fragment and end_fragment:
-                return _extract_fragment_span_markdown(
+            if start_fragment is None and end_fragment is None:
+                text = _render_full_for_mode(
                     content_data,
-                    start_fragment=start_fragment,
-                    end_fragment=end_fragment,
                     markdown_mode=markdown_mode,
                     image_resolver=image_resolver,
                 )
+                return text, _collect_content_anchors(content_data)
+            body = _find_body_node(content_data.tree)
+            if body is None:
+                return None, []
+            children = list(body)
+            if not children:
+                return None, []
+            start_idx = 0
             if start_fragment:
-                return _extract_from_fragment_markdown(
-                    content_data,
-                    start_fragment=start_fragment,
-                    markdown_mode=markdown_mode,
-                    image_resolver=image_resolver,
-                )
+                start_anchor = _find_anchor_node(content_data.tree, start_fragment)
+                if start_anchor is None:
+                    return None, []
+                start_top = _top_level_body_child(body, start_anchor)
+                if start_top is None:
+                    return None, []
+                try:
+                    start_idx = children.index(start_top)
+                except ValueError:
+                    return None, []
+            end_idx = len(children)
             if end_fragment:
-                return _extract_until_fragment_markdown(
-                    content_data,
-                    end_fragment=end_fragment,
-                    markdown_mode=markdown_mode,
-                    image_resolver=image_resolver,
-                )
-            return _render_full_for_mode(
-                content_data,
+                end_anchor = _find_anchor_node(content_data.tree, end_fragment)
+                if end_anchor is not None:
+                    end_top = _top_level_body_child(body, end_anchor)
+                    if end_top is not None:
+                        try:
+                            candidate = children.index(end_top)
+                        except ValueError:
+                            candidate = end_idx
+                        if candidate > start_idx:
+                            end_idx = candidate
+            nodes = children[start_idx:end_idx]
+            if not nodes:
+                return None, []
+            text = _render_nodes_markdown(
+                nodes,
                 markdown_mode=markdown_mode,
                 image_resolver=image_resolver,
             )
+            return text if text else None, _collect_node_anchors(nodes)
 
         use_heading_fallback = False
         attempt_heading_fallback = False
@@ -1096,8 +1508,8 @@ def parse_epub(
             if toc_is_degenerate:
                 attempt_heading_fallback = True
             else:
-                print(
-                    f"Warning: heading fallback skipped for {title}: TOC not degenerate "
+                warn(
+                    f"heading fallback skipped for {title}: TOC not degenerate "
                     f"(entries={toc_entry_count}, unique_hrefs={toc_unique_count}, "
                     f"coverage={toc_coverage_ratio:.2f})."
                 )
@@ -1118,14 +1530,12 @@ def parse_epub(
                 for candidate in confident_candidates:
                     label = candidate.label or f"Section {len(starts) + 1}"
                     starts.append((candidate.spine_idx, label))
-
-                print(
-                    f"Warning: using heading fallback for {title} "
+                warn(
+                    f"using heading fallback for {title} "
                     f"(mode={chapter_fallback}, toc_entries={toc_entry_count}, "
                     f"spine_docs={len(spine_entries)}, detected_starts={len(confident_candidates)})."
                 )
                 use_heading_fallback = True
-
                 for start_index, (start_idx, section_label) in enumerate(starts):
                     next_start = (
                         starts[start_index + 1][0]
@@ -1136,103 +1546,116 @@ def parse_epub(
                     if end_idx < start_idx:
                         continue
                     chunks: list[str] = []
+                    anchors: set[str] = set()
                     for spine_idx in range(start_idx, end_idx + 1):
                         href = spine_entries[spine_idx][1]
                         content_data = get_content_data(href)
                         if content_data is None:
                             continue
                         record_css_for_content(content_data)
-                        image_resolver = make_image_resolver(content_data.href)
-                        part = _render_full_for_mode(
-                            content_data,
-                            markdown_mode=markdown_mode,
-                            image_resolver=image_resolver,
-                        )
+                        part, part_anchors = render_partial_content(content_data, None, None)
                         if part:
                             chunks.append(part)
+                        anchors.update(part_anchors)
                     text = _normalize_text("\n\n".join(chunks))
                     if text:
-                        sections.append((section_label, text))
+                        sections.append(
+                            SectionRecord(
+                                title=section_label,
+                                text=text,
+                                start_href=spine_entries[start_idx][1],
+                                start_fragment=None,
+                                end_href=spine_entries[end_idx][1],
+                                end_fragment=None,
+                                spine_start=start_idx,
+                                spine_end=end_idx,
+                                anchors=sorted(anchors),
+                            )
+                        )
             else:
-                print(
-                    f"Warning: heading fallback skipped for {title}: insufficient heading confidence."
-                )
+                warn(f"heading fallback skipped for {title}: insufficient heading confidence.")
 
         if not use_heading_fallback and toc_entries:
             for idx, entry in enumerate(toc_entries):
                 start_idx = spine_index_by_href.get(entry.href)
                 if start_idx is None:
                     continue
-
                 next_entry = toc_entries[idx + 1] if idx + 1 < len(toc_entries) else None
-                end_idx: Optional[int] = None
                 if next_entry is not None:
-                    end_idx = spine_index_by_href.get(next_entry.href)
-                    if end_idx is None:
-                        end_idx = len(spine_entries) - 1
+                    end_idx = spine_index_by_href.get(next_entry.href, len(spine_entries) - 1)
                 else:
                     end_idx = len(spine_entries) - 1
                 if end_idx < start_idx:
                     continue
-
                 chunks: list[str] = []
+                anchors: set[str] = set()
                 for spine_idx in range(start_idx, end_idx + 1):
                     href = spine_entries[spine_idx][1]
                     content_data = get_content_data(href)
                     if content_data is None:
                         continue
                     record_css_for_content(content_data)
-
-                    start_fragment = None
+                    start_fragment = entry.fragment if spine_idx == start_idx else None
                     end_fragment = None
-                    if spine_idx == start_idx:
-                        start_fragment = entry.fragment
-                    if next_entry is not None and spine_idx == end_idx:
-                        end_fragment = next_entry.fragment
-                        if next_entry.fragment is None and next_entry.href == href:
-                            end_fragment = None
-
                     if next_entry is not None and spine_idx == end_idx:
                         if next_entry.fragment is None:
-                            # Next section starts at the beginning of this file.
                             continue
-
-                    part = render_partial_content(
+                        end_fragment = next_entry.fragment
+                    part, part_anchors = render_partial_content(
                         content_data,
                         start_fragment=start_fragment,
                         end_fragment=end_fragment,
                     )
                     if part:
                         chunks.append(part)
-
+                    anchors.update(part_anchors)
                 text = _normalize_text("\n\n".join(chunks))
                 if text:
-                    sections.append((entry.label, text))
+                    sections.append(
+                        SectionRecord(
+                            title=entry.label,
+                            text=text,
+                            start_href=entry.href,
+                            start_fragment=entry.fragment,
+                            end_href=next_entry.href if next_entry else None,
+                            end_fragment=next_entry.fragment if next_entry else None,
+                            spine_start=start_idx,
+                            spine_end=end_idx,
+                            anchors=sorted(anchors),
+                        )
+                    )
         elif not use_heading_fallback:
-            for _, href in spine_entries:
+            for spine_idx, (_, href) in enumerate(spine_entries):
                 content_data = get_content_data(href)
                 if content_data is None:
                     continue
                 record_css_for_content(content_data)
-                image_resolver = make_image_resolver(content_data.href)
-                text = _render_full_for_mode(
-                    content_data, markdown_mode=markdown_mode, image_resolver=image_resolver
-                )
-                if not text:
+                part, anchors = render_partial_content(content_data, None, None)
+                if not part:
                     continue
-                sections.append((_prettify_section_name(href), text))
+                sections.append(
+                    SectionRecord(
+                        title=_prettify_section_name(href),
+                        text=part,
+                        start_href=href,
+                        start_fragment=None,
+                        end_href=None,
+                        end_fragment=None,
+                        spine_start=spine_idx,
+                        spine_end=spine_idx,
+                        anchors=sorted(set(anchors)),
+                    )
+                )
 
         if markdown_mode == "rich" and (css_hrefs or inline_styles):
             if style_mode == "external":
-                styles_root = output_dir / book_slug / "styles"
+                styles_root = book_dir / "styles"
                 for href in sorted(css_hrefs):
                     zip_path = posixpath.join(doc.package_href, href)
                     output_path = styles_root / href
                     if _extract_zip_file(epub_zip, zip_map, zip_path, output_path):
                         rel_path = f"{style_link_prefix}/{href}"
-                        style_header_lines.append(
-                            f'<link rel="stylesheet" href="{rel_path}">'
-                        )
+                        style_header_lines.append(f'<link rel="stylesheet" href="{rel_path}">')
                 if inline_styles:
                     inline_css_path = styles_root / "inline_styles.css"
                     inline_css_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1258,7 +1681,108 @@ def parse_epub(
     if not sections:
         return None
 
-    output_root = output_dir / book_slug if split_chapters else output_dir
+    # Deterministic IDs and cleanup transforms.
+    cleanup_changes_total = 0
+    for section in sections:
+        section.section_id = _build_section_id(
+            section.start_href,
+            section.start_fragment,
+            section.end_href,
+            section.end_fragment,
+        )
+        cleaned, changes = _apply_ocr_cleanup(section.text, ocr_cleanup)
+        section.text = cleaned
+        cleanup_changes_total += changes
+
+    # Decide output file names first so link rewriting can target final files.
+    if split_chapters:
+        width = max(2, len(str(len(sections))))
+        for index, section in enumerate(sections, start=1):
+            section_slug = _slugify(section.title) if section.title.strip() else f"section_{index:0{width}d}"
+            section_slug = section_slug[:80].strip("_.-") or f"section_{index:0{width}d}"
+            if filename_scheme == "stable":
+                filename = f"{section.section_id}_{section_slug}.md"
+            else:
+                filename = f"{index:0{width}d}_{section_slug}.md"
+            section.output_path = filename
+    else:
+        for section in sections:
+            section.output_path = f"{book_slug}.md"
+
+    # Internal link rewrite + validation.
+    href_to_section: dict[str, int] = {}
+    anchor_to_section: dict[tuple[str, str], int] = {}
+    for idx, section in enumerate(sections):
+        href_to_section.setdefault(section.start_href, idx)
+        for anchor in section.anchors:
+            anchor_to_section[(section.start_href, anchor)] = idx
+        if section.start_fragment:
+            anchor_to_section[(section.start_href, section.start_fragment)] = idx
+
+    link_rewritten = 0
+    link_unresolved = 0
+
+    for idx, section in enumerate(sections):
+        def replace_target(target: str) -> tuple[str, bool]:
+            resolved = _resolve_internal_target(target, section.start_href)
+            if resolved is None:
+                return target, True
+            target_href, fragment, _ = resolved
+            target_idx = None
+            if fragment:
+                target_idx = anchor_to_section.get((target_href, fragment))
+            if target_idx is None:
+                target_idx = href_to_section.get(target_href)
+            if target_idx is None:
+                return target, False
+            if split_chapters:
+                if target_idx == idx:
+                    return (f"#{fragment}" if fragment else f"./{sections[target_idx].output_path}"), True
+                new_target = f"./{sections[target_idx].output_path}"
+                if fragment:
+                    new_target = f"{new_target}#{fragment}"
+                return new_target, True
+            if fragment:
+                return f"#{fragment}", True
+            return f"#{sections[target_idx].section_id}", True
+
+        rewritten_md, md_stats = _replace_markdown_links(section.text, replace_target)
+        rewritten_html, html_stats = _replace_html_links(rewritten_md, replace_target)
+        section.text = rewritten_html
+        link_rewritten += md_stats.rewritten + html_stats.rewritten
+        link_unresolved += md_stats.unresolved + html_stats.unresolved
+
+    if link_unresolved:
+        warn(f"{title}: unresolved internal links detected ({link_unresolved}).")
+
+    # Footnote/endnote handling.
+    notes_total = 0
+    global_note_lines: list[str] = []
+    if notes_mode in {"chapter-end", "global"}:
+        for section in sections:
+            stripped, notes = _extract_markdown_footnotes(section.text)
+            if not notes:
+                continue
+            id_map: dict[str, str] = {}
+            for ordinal, note_id in enumerate(sorted(notes), start=1):
+                id_map[note_id] = f"note-{section.section_id}-{ordinal:03d}"
+            section.text = _rewrite_note_refs(stripped, id_map)
+            rendered_defs = [
+                f"[^{id_map[nid]}]: {notes[nid]}"
+                for nid in sorted(notes)
+            ]
+            notes_total += len(rendered_defs)
+            if notes_mode == "chapter-end":
+                section.text = _normalize_text(
+                    section.text + "\n\n### Notes\n\n" + "\n".join(rendered_defs)
+                )
+            else:
+                global_note_lines.append(f"## {section.title} ({section.section_id})")
+                global_note_lines.append("")
+                global_note_lines.extend(rendered_defs)
+                global_note_lines.append("")
+
+    output_root = book_dir if split_chapters else output_dir
     output_root.mkdir(parents=True, exist_ok=True)
 
     base_lines: list[str] = [f"# {title}"]
@@ -1272,34 +1796,158 @@ def parse_epub(
     if split_chapters:
         for stale in output_root.glob("*.md"):
             stale.unlink()
-        width = max(2, len(str(len(sections))))
-        for index, (section_title, section_text) in enumerate(sections, start=1):
-            if section_title.strip():
-                section_slug = _slugify(section_title)
-            else:
-                section_slug = f"section_{index:0{width}d}"
-            section_slug = section_slug[:80].strip("_.-") or f"section_{index:0{width}d}"
-            filename = f"{index:0{width}d}_{section_slug}.md"
+        for section in sections:
             lines = list(base_lines)
-            lines.append(f"## {section_title}")
+            lines.append(f'<a id="{section.section_id}"></a>')
+            lines.append(f"## {section.title}")
             lines.append("")
-            lines.append(section_text)
+            lines.append(section.text)
             lines.append("")
-            (output_root / filename).write_text(
+            (output_root / section.output_path).write_text(
                 "\n".join(lines).strip() + "\n", encoding="utf-8"
             )
     else:
         output_path = output_root / f"{book_slug}.md"
         lines: list[str] = list(base_lines)
-        for section_title, section_text in sections:
-            lines.append(f"## {section_title}")
+        for section in sections:
+            lines.append(f'<a id="{section.section_id}"></a>')
+            lines.append(f"## {section.title}")
             lines.append("")
-            lines.append(section_text)
+            lines.append(section.text)
             lines.append("")
+        if notes_mode == "global" and global_note_lines:
+            lines.append("## Notes")
+            lines.append("")
+            lines.extend(global_note_lines)
         output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    if notes_mode == "global" and global_note_lines:
+        notes_path = book_dir / "notes.md"
+        notes_path.parent.mkdir(parents=True, exist_ok=True)
+        notes_path.write_text(
+            "# Notes\n\n" + "\n".join(global_note_lines).strip() + "\n",
+            encoding="utf-8",
+        )
 
     if extracted_count:
         print(f"Extracted {extracted_count} images for {title}")
+    if extracted_media_count:
+        print(f"Extracted {extracted_media_count} media files for {title}")
+
+    if export_manifest == "v1":
+        manifest_path = book_dir / "manifest.v1.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_payload = {
+            "schema_version": "v1",
+            "book": {
+                "title": title,
+                "authors": authors or "",
+                "slug": book_slug,
+            },
+            "spine": [
+                {"index": idx, "href": href, "idref": content_id}
+                for idx, (content_id, href) in enumerate(spine_entries)
+            ],
+            "toc_tree": [
+                {
+                    "order": entry.order,
+                    "label": entry.label,
+                    "href": entry.href,
+                    "fragment": entry.fragment,
+                }
+                for entry in toc_entries
+            ],
+            "sections": [
+                {
+                    "section_id": section.section_id,
+                    "order": idx + 1,
+                    "title": section.title,
+                    "output_path": (
+                        f"{book_slug}/{section.output_path}"
+                        if split_chapters
+                        else section.output_path
+                    ),
+                    "source_start": {
+                        "href": section.start_href,
+                        "fragment": section.start_fragment,
+                        "spine_index": section.spine_start,
+                    },
+                    "source_end": {
+                        "href": section.end_href,
+                        "fragment": section.end_fragment,
+                        "spine_index": section.spine_end,
+                    },
+                    "anchors": section.anchors,
+                }
+                for idx, section in enumerate(sections)
+            ],
+            "landmarks": [],
+            "page_list": [],
+            "assets": {
+                "images": sorted(extracted_images.keys()),
+                "media": sorted(extracted_media.keys()),
+            },
+            "build": {
+                "markdown_mode": markdown_mode,
+                "style": style_mode,
+                "split_chapters": split_chapters,
+                "chapter_fallback": chapter_fallback,
+                "notes_mode": notes_mode,
+                "ocr_cleanup": ocr_cleanup,
+                "nav_cleanup": nav_cleanup,
+                "filename_scheme": filename_scheme,
+            },
+        }
+        manifest_path.write_text(
+            json.dumps(manifest_payload, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+
+    if quality_report == "v1":
+        report_path = book_dir / "report.v1.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_payload = {
+            "toc_stats": {
+                "entries": toc_entry_count,
+                "unique_hrefs": toc_unique_count,
+                "coverage_ratio": round(toc_coverage_ratio, 4),
+                "degenerate": toc_is_degenerate,
+            },
+            "fallback_stats": {
+                "mode": chapter_fallback,
+                "used_heading_fallback": use_heading_fallback,
+            },
+            "link_stats": {
+                "rewritten": link_rewritten,
+                "unresolved": link_unresolved,
+            },
+            "asset_stats": {
+                "images_extracted": extracted_count,
+                "media_extracted": extracted_media_count,
+                "missing_assets": len(
+                    [message for message in warnings if "missing media" in message]
+                ),
+            },
+            "ocr_stats": {
+                "mode": ocr_cleanup,
+                "cleanup_changes": cleanup_changes_total,
+            },
+            "cleanup_stats": {
+                "nav_cleanup_mode": nav_cleanup,
+                "toc_entries_removed": nav_removed,
+            },
+            "notes_stats": {
+                "mode": notes_mode,
+                "notes_written": notes_total,
+            },
+            "warnings": warnings,
+            "errors": errors,
+        }
+        report_path.write_text(
+            json.dumps(report_payload, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+
     return output_root if split_chapters else output_dir / f"{book_slug}.md"
 
 
@@ -1351,6 +1999,42 @@ def main() -> int:
         default="auto",
         help="Fallback chapter splitting mode based on heading confidence.",
     )
+    parser.add_argument(
+        "--notes-mode",
+        choices=["inline", "chapter-end", "global"],
+        default="inline",
+        help="How to render footnotes/endnotes in Markdown output.",
+    )
+    parser.add_argument(
+        "--export-manifest",
+        choices=["off", "v1"],
+        default="off",
+        help="Emit machine-readable manifest JSON for each book.",
+    )
+    parser.add_argument(
+        "--quality-report",
+        choices=["off", "v1"],
+        default="off",
+        help="Emit quality report JSON for each book.",
+    )
+    parser.add_argument(
+        "--ocr-cleanup",
+        choices=["off", "basic", "aggressive"],
+        default="off",
+        help="Optional OCR cleanup heuristics.",
+    )
+    parser.add_argument(
+        "--nav-cleanup",
+        choices=["off", "auto"],
+        default="auto",
+        help="TOC/navigation dedupe cleanup mode.",
+    )
+    parser.add_argument(
+        "--filename-scheme",
+        choices=["legacy", "stable"],
+        default="legacy",
+        help="Split-chapter output naming strategy.",
+    )
     args = parser.parse_args()
 
     epub_paths = sorted(args.input_dir.rglob("*.epub"))
@@ -1369,6 +2053,12 @@ def main() -> int:
                 style_mode=args.style,
                 split_chapters=args.split_chapters,
                 chapter_fallback=args.chapter_fallback,
+                notes_mode=args.notes_mode,
+                export_manifest=args.export_manifest,
+                quality_report=args.quality_report,
+                ocr_cleanup=args.ocr_cleanup,
+                nav_cleanup=args.nav_cleanup,
+                filename_scheme=args.filename_scheme,
             )
         except Exception as exc:
             failures += 1
