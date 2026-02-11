@@ -10,7 +10,7 @@ import re
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -93,6 +93,15 @@ class SectionRecord:
 class LinkValidationResult:
     rewritten: int = 0
     unresolved: int = 0
+
+
+@dataclass
+class PostprocessStats:
+    link_rewritten: int = 0
+    link_unresolved: int = 0
+    cleanup_changes_total: int = 0
+    notes_total: int = 0
+    global_note_lines: list[str] = field(default_factory=list)
 
 
 class _HtmlToMarkdown(HTMLParser):
@@ -1257,6 +1266,352 @@ def _rewrite_note_refs(text: str, id_map: dict[str, str]) -> str:
     )
 
 
+def _assign_section_output_paths(
+    sections: list[SectionRecord],
+    split_chapters: bool,
+    filename_scheme: str,
+    book_slug: str,
+) -> None:
+    if not split_chapters:
+        for section in sections:
+            section.output_path = f"{book_slug}.md"
+        return
+    width = max(2, len(str(len(sections))))
+    for index, section in enumerate(sections, start=1):
+        section_slug = _slugify(section.title) if section.title.strip() else f"section_{index:0{width}d}"
+        section_slug = section_slug[:80].strip("_.-") or f"section_{index:0{width}d}"
+        if filename_scheme == "stable":
+            section.output_path = f"{section.section_id}_{section_slug}.md"
+        else:
+            section.output_path = f"{index:0{width}d}_{section_slug}.md"
+
+
+def _rewrite_section_links(
+    sections: list[SectionRecord],
+    split_chapters: bool,
+) -> LinkValidationResult:
+    href_to_section: dict[str, int] = {}
+    anchor_to_section: dict[tuple[str, str], int] = {}
+    for idx, section in enumerate(sections):
+        href_to_section.setdefault(section.start_href, idx)
+        for anchor in section.anchors:
+            anchor_to_section[(section.start_href, anchor)] = idx
+        if section.start_fragment:
+            anchor_to_section[(section.start_href, section.start_fragment)] = idx
+
+    result = LinkValidationResult()
+    for idx, section in enumerate(sections):
+        def replace_target(target: str) -> tuple[str, bool]:
+            resolved = _resolve_internal_target(target, section.start_href)
+            if resolved is None:
+                return target, True
+            target_href, fragment, _ = resolved
+            target_idx = None
+            if fragment:
+                target_idx = anchor_to_section.get((target_href, fragment))
+            if target_idx is None:
+                target_idx = href_to_section.get(target_href)
+            if target_idx is None:
+                return target, False
+            if split_chapters:
+                if target_idx == idx:
+                    if fragment:
+                        return f"#{fragment}", True
+                    return f"./{sections[target_idx].output_path}", True
+                new_target = f"./{sections[target_idx].output_path}"
+                if fragment:
+                    new_target = f"{new_target}#{fragment}"
+                return new_target, True
+            if fragment:
+                return f"#{fragment}", True
+            return f"#{sections[target_idx].section_id}", True
+
+        rewritten_md, md_stats = _replace_markdown_links(section.text, replace_target)
+        rewritten_html, html_stats = _replace_html_links(rewritten_md, replace_target)
+        section.text = rewritten_html
+        result.rewritten += md_stats.rewritten + html_stats.rewritten
+        result.unresolved += md_stats.unresolved + html_stats.unresolved
+    return result
+
+
+def _apply_notes_mode_to_sections(
+    sections: list[SectionRecord], notes_mode: str
+) -> tuple[int, list[str]]:
+    notes_total = 0
+    global_note_lines: list[str] = []
+    if notes_mode not in {"chapter-end", "global"}:
+        return notes_total, global_note_lines
+    for section in sections:
+        stripped, notes = _extract_markdown_footnotes(section.text)
+        if not notes:
+            continue
+        id_map: dict[str, str] = {}
+        for ordinal, note_id in enumerate(sorted(notes), start=1):
+            id_map[note_id] = f"note-{section.section_id}-{ordinal:03d}"
+        section.text = _rewrite_note_refs(stripped, id_map)
+        rendered_defs = [
+            f"[^{id_map[nid]}]: {notes[nid]}"
+            for nid in sorted(notes)
+        ]
+        notes_total += len(rendered_defs)
+        if notes_mode == "chapter-end":
+            section.text = _normalize_text(
+                section.text + "\n\n### Notes\n\n" + "\n".join(rendered_defs)
+            )
+        else:
+            global_note_lines.append(f"## {section.title} ({section.section_id})")
+            global_note_lines.append("")
+            global_note_lines.extend(rendered_defs)
+            global_note_lines.append("")
+    return notes_total, global_note_lines
+
+
+def _postprocess_sections(
+    sections: list[SectionRecord],
+    split_chapters: bool,
+    filename_scheme: str,
+    book_slug: str,
+    ocr_cleanup: str,
+    notes_mode: str,
+) -> PostprocessStats:
+    stats = PostprocessStats()
+    for section in sections:
+        section.section_id = _build_section_id(
+            section.start_href,
+            section.start_fragment,
+            section.end_href,
+            section.end_fragment,
+        )
+        cleaned, changes = _apply_ocr_cleanup(section.text, ocr_cleanup)
+        section.text = cleaned
+        stats.cleanup_changes_total += changes
+    _assign_section_output_paths(sections, split_chapters, filename_scheme, book_slug)
+    link_stats = _rewrite_section_links(sections, split_chapters)
+    stats.link_rewritten = link_stats.rewritten
+    stats.link_unresolved = link_stats.unresolved
+    stats.notes_total, stats.global_note_lines = _apply_notes_mode_to_sections(
+        sections, notes_mode
+    )
+    return stats
+
+
+def _write_markdown_outputs(
+    sections: list[SectionRecord],
+    output_dir: Path,
+    book_dir: Path,
+    book_slug: str,
+    title: str,
+    authors: Optional[str],
+    style_header_lines: list[str],
+    split_chapters: bool,
+    notes_mode: str,
+    global_note_lines: list[str],
+) -> Path:
+    output_root = book_dir if split_chapters else output_dir
+    output_root.mkdir(parents=True, exist_ok=True)
+    base_lines: list[str] = [f"# {title}"]
+    if authors:
+        base_lines.append(f"**Author:** {authors}")
+    if style_header_lines:
+        base_lines.append("")
+        base_lines.extend(style_header_lines)
+    base_lines.append("")
+
+    if split_chapters:
+        for stale in output_root.glob("*.md"):
+            stale.unlink()
+        for section in sections:
+            lines = list(base_lines)
+            lines.append(f'<a id="{section.section_id}"></a>')
+            lines.append(f"## {section.title}")
+            lines.append("")
+            lines.append(section.text)
+            lines.append("")
+            (output_root / section.output_path).write_text(
+                "\n".join(lines).strip() + "\n", encoding="utf-8"
+            )
+    else:
+        output_path = output_root / f"{book_slug}.md"
+        lines: list[str] = list(base_lines)
+        for section in sections:
+            lines.append(f'<a id="{section.section_id}"></a>')
+            lines.append(f"## {section.title}")
+            lines.append("")
+            lines.append(section.text)
+            lines.append("")
+        if notes_mode == "global" and global_note_lines:
+            lines.append("## Notes")
+            lines.append("")
+            lines.extend(global_note_lines)
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    if notes_mode == "global" and global_note_lines:
+        notes_path = book_dir / "notes.md"
+        notes_path.parent.mkdir(parents=True, exist_ok=True)
+        notes_path.write_text(
+            "# Notes\n\n" + "\n".join(global_note_lines).strip() + "\n",
+            encoding="utf-8",
+        )
+    return output_root if split_chapters else output_dir / f"{book_slug}.md"
+
+
+def _write_manifest_export(
+    book_dir: Path,
+    enabled: str,
+    title: str,
+    authors: Optional[str],
+    book_slug: str,
+    spine_entries: list[tuple[str, str]],
+    toc_entries: list[TocEntry],
+    sections: list[SectionRecord],
+    extracted_images: dict[str, str],
+    extracted_media: dict[str, str],
+    markdown_mode: str,
+    style_mode: str,
+    split_chapters: bool,
+    chapter_fallback: str,
+    notes_mode: str,
+    ocr_cleanup: str,
+    nav_cleanup: str,
+    filename_scheme: str,
+) -> None:
+    if enabled != "v1":
+        return
+    manifest_path = book_dir / "manifest.v1.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_payload = {
+        "schema_version": "v1",
+        "book": {
+            "title": title,
+            "authors": authors or "",
+            "slug": book_slug,
+        },
+        "spine": [
+            {"index": idx, "href": href, "idref": content_id}
+            for idx, (content_id, href) in enumerate(spine_entries)
+        ],
+        "toc_tree": [
+            {
+                "order": entry.order,
+                "label": entry.label,
+                "href": entry.href,
+                "fragment": entry.fragment,
+            }
+            for entry in toc_entries
+        ],
+        "sections": [
+            {
+                "section_id": section.section_id,
+                "order": idx + 1,
+                "title": section.title,
+                "output_path": (
+                    f"{book_slug}/{section.output_path}"
+                    if split_chapters
+                    else section.output_path
+                ),
+                "source_start": {
+                    "href": section.start_href,
+                    "fragment": section.start_fragment,
+                    "spine_index": section.spine_start,
+                },
+                "source_end": {
+                    "href": section.end_href,
+                    "fragment": section.end_fragment,
+                    "spine_index": section.spine_end,
+                },
+                "anchors": section.anchors,
+            }
+            for idx, section in enumerate(sections)
+        ],
+        "landmarks": [],
+        "page_list": [],
+        "assets": {
+            "images": sorted(extracted_images.keys()),
+            "media": sorted(extracted_media.keys()),
+        },
+        "build": {
+            "markdown_mode": markdown_mode,
+            "style": style_mode,
+            "split_chapters": split_chapters,
+            "chapter_fallback": chapter_fallback,
+            "notes_mode": notes_mode,
+            "ocr_cleanup": ocr_cleanup,
+            "nav_cleanup": nav_cleanup,
+            "filename_scheme": filename_scheme,
+        },
+    }
+    manifest_path.write_text(
+        json.dumps(manifest_payload, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_quality_report(
+    book_dir: Path,
+    enabled: str,
+    toc_entry_count: int,
+    toc_unique_count: int,
+    toc_coverage_ratio: float,
+    toc_is_degenerate: bool,
+    chapter_fallback: str,
+    use_heading_fallback: bool,
+    stats: PostprocessStats,
+    extracted_count: int,
+    extracted_media_count: int,
+    ocr_cleanup: str,
+    nav_cleanup: str,
+    nav_removed: int,
+    notes_mode: str,
+    warnings: list[str],
+    errors: list[str],
+) -> None:
+    if enabled != "v1":
+        return
+    report_path = book_dir / "report.v1.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_payload = {
+        "toc_stats": {
+            "entries": toc_entry_count,
+            "unique_hrefs": toc_unique_count,
+            "coverage_ratio": round(toc_coverage_ratio, 4),
+            "degenerate": toc_is_degenerate,
+        },
+        "fallback_stats": {
+            "mode": chapter_fallback,
+            "used_heading_fallback": use_heading_fallback,
+        },
+        "link_stats": {
+            "rewritten": stats.link_rewritten,
+            "unresolved": stats.link_unresolved,
+        },
+        "asset_stats": {
+            "images_extracted": extracted_count,
+            "media_extracted": extracted_media_count,
+            "missing_assets": len(
+                [message for message in warnings if "missing media" in message]
+            ),
+        },
+        "ocr_stats": {
+            "mode": ocr_cleanup,
+            "cleanup_changes": stats.cleanup_changes_total,
+        },
+        "cleanup_stats": {
+            "nav_cleanup_mode": nav_cleanup,
+            "toc_entries_removed": nav_removed,
+        },
+        "notes_stats": {
+            "mode": notes_mode,
+            "notes_written": stats.notes_total,
+        },
+        "warnings": warnings,
+        "errors": errors,
+    }
+    report_path.write_text(
+        json.dumps(report_payload, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def parse_epub(
     epub_path: Path,
     output_dir: Path,
@@ -1681,274 +2036,74 @@ def parse_epub(
     if not sections:
         return None
 
-    # Deterministic IDs and cleanup transforms.
-    cleanup_changes_total = 0
-    for section in sections:
-        section.section_id = _build_section_id(
-            section.start_href,
-            section.start_fragment,
-            section.end_href,
-            section.end_fragment,
-        )
-        cleaned, changes = _apply_ocr_cleanup(section.text, ocr_cleanup)
-        section.text = cleaned
-        cleanup_changes_total += changes
-
-    # Decide output file names first so link rewriting can target final files.
-    if split_chapters:
-        width = max(2, len(str(len(sections))))
-        for index, section in enumerate(sections, start=1):
-            section_slug = _slugify(section.title) if section.title.strip() else f"section_{index:0{width}d}"
-            section_slug = section_slug[:80].strip("_.-") or f"section_{index:0{width}d}"
-            if filename_scheme == "stable":
-                filename = f"{section.section_id}_{section_slug}.md"
-            else:
-                filename = f"{index:0{width}d}_{section_slug}.md"
-            section.output_path = filename
-    else:
-        for section in sections:
-            section.output_path = f"{book_slug}.md"
-
-    # Internal link rewrite + validation.
-    href_to_section: dict[str, int] = {}
-    anchor_to_section: dict[tuple[str, str], int] = {}
-    for idx, section in enumerate(sections):
-        href_to_section.setdefault(section.start_href, idx)
-        for anchor in section.anchors:
-            anchor_to_section[(section.start_href, anchor)] = idx
-        if section.start_fragment:
-            anchor_to_section[(section.start_href, section.start_fragment)] = idx
-
-    link_rewritten = 0
-    link_unresolved = 0
-
-    for idx, section in enumerate(sections):
-        def replace_target(target: str) -> tuple[str, bool]:
-            resolved = _resolve_internal_target(target, section.start_href)
-            if resolved is None:
-                return target, True
-            target_href, fragment, _ = resolved
-            target_idx = None
-            if fragment:
-                target_idx = anchor_to_section.get((target_href, fragment))
-            if target_idx is None:
-                target_idx = href_to_section.get(target_href)
-            if target_idx is None:
-                return target, False
-            if split_chapters:
-                if target_idx == idx:
-                    return (f"#{fragment}" if fragment else f"./{sections[target_idx].output_path}"), True
-                new_target = f"./{sections[target_idx].output_path}"
-                if fragment:
-                    new_target = f"{new_target}#{fragment}"
-                return new_target, True
-            if fragment:
-                return f"#{fragment}", True
-            return f"#{sections[target_idx].section_id}", True
-
-        rewritten_md, md_stats = _replace_markdown_links(section.text, replace_target)
-        rewritten_html, html_stats = _replace_html_links(rewritten_md, replace_target)
-        section.text = rewritten_html
-        link_rewritten += md_stats.rewritten + html_stats.rewritten
-        link_unresolved += md_stats.unresolved + html_stats.unresolved
-
-    if link_unresolved:
-        warn(f"{title}: unresolved internal links detected ({link_unresolved}).")
-
-    # Footnote/endnote handling.
-    notes_total = 0
-    global_note_lines: list[str] = []
-    if notes_mode in {"chapter-end", "global"}:
-        for section in sections:
-            stripped, notes = _extract_markdown_footnotes(section.text)
-            if not notes:
-                continue
-            id_map: dict[str, str] = {}
-            for ordinal, note_id in enumerate(sorted(notes), start=1):
-                id_map[note_id] = f"note-{section.section_id}-{ordinal:03d}"
-            section.text = _rewrite_note_refs(stripped, id_map)
-            rendered_defs = [
-                f"[^{id_map[nid]}]: {notes[nid]}"
-                for nid in sorted(notes)
-            ]
-            notes_total += len(rendered_defs)
-            if notes_mode == "chapter-end":
-                section.text = _normalize_text(
-                    section.text + "\n\n### Notes\n\n" + "\n".join(rendered_defs)
-                )
-            else:
-                global_note_lines.append(f"## {section.title} ({section.section_id})")
-                global_note_lines.append("")
-                global_note_lines.extend(rendered_defs)
-                global_note_lines.append("")
-
-    output_root = book_dir if split_chapters else output_dir
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    base_lines: list[str] = [f"# {title}"]
-    if authors:
-        base_lines.append(f"**Author:** {authors}")
-    if style_header_lines:
-        base_lines.append("")
-        base_lines.extend(style_header_lines)
-    base_lines.append("")
-
-    if split_chapters:
-        for stale in output_root.glob("*.md"):
-            stale.unlink()
-        for section in sections:
-            lines = list(base_lines)
-            lines.append(f'<a id="{section.section_id}"></a>')
-            lines.append(f"## {section.title}")
-            lines.append("")
-            lines.append(section.text)
-            lines.append("")
-            (output_root / section.output_path).write_text(
-                "\n".join(lines).strip() + "\n", encoding="utf-8"
-            )
-    else:
-        output_path = output_root / f"{book_slug}.md"
-        lines: list[str] = list(base_lines)
-        for section in sections:
-            lines.append(f'<a id="{section.section_id}"></a>')
-            lines.append(f"## {section.title}")
-            lines.append("")
-            lines.append(section.text)
-            lines.append("")
-        if notes_mode == "global" and global_note_lines:
-            lines.append("## Notes")
-            lines.append("")
-            lines.extend(global_note_lines)
-        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-
-    if notes_mode == "global" and global_note_lines:
-        notes_path = book_dir / "notes.md"
-        notes_path.parent.mkdir(parents=True, exist_ok=True)
-        notes_path.write_text(
-            "# Notes\n\n" + "\n".join(global_note_lines).strip() + "\n",
-            encoding="utf-8",
-        )
+    stats = _postprocess_sections(
+        sections,
+        split_chapters=split_chapters,
+        filename_scheme=filename_scheme,
+        book_slug=book_slug,
+        ocr_cleanup=ocr_cleanup,
+        notes_mode=notes_mode,
+    )
+    if stats.link_unresolved:
+        warn(f"{title}: unresolved internal links detected ({stats.link_unresolved}).")
 
     if extracted_count:
         print(f"Extracted {extracted_count} images for {title}")
     if extracted_media_count:
         print(f"Extracted {extracted_media_count} media files for {title}")
 
-    if export_manifest == "v1":
-        manifest_path = book_dir / "manifest.v1.json"
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_payload = {
-            "schema_version": "v1",
-            "book": {
-                "title": title,
-                "authors": authors or "",
-                "slug": book_slug,
-            },
-            "spine": [
-                {"index": idx, "href": href, "idref": content_id}
-                for idx, (content_id, href) in enumerate(spine_entries)
-            ],
-            "toc_tree": [
-                {
-                    "order": entry.order,
-                    "label": entry.label,
-                    "href": entry.href,
-                    "fragment": entry.fragment,
-                }
-                for entry in toc_entries
-            ],
-            "sections": [
-                {
-                    "section_id": section.section_id,
-                    "order": idx + 1,
-                    "title": section.title,
-                    "output_path": (
-                        f"{book_slug}/{section.output_path}"
-                        if split_chapters
-                        else section.output_path
-                    ),
-                    "source_start": {
-                        "href": section.start_href,
-                        "fragment": section.start_fragment,
-                        "spine_index": section.spine_start,
-                    },
-                    "source_end": {
-                        "href": section.end_href,
-                        "fragment": section.end_fragment,
-                        "spine_index": section.spine_end,
-                    },
-                    "anchors": section.anchors,
-                }
-                for idx, section in enumerate(sections)
-            ],
-            "landmarks": [],
-            "page_list": [],
-            "assets": {
-                "images": sorted(extracted_images.keys()),
-                "media": sorted(extracted_media.keys()),
-            },
-            "build": {
-                "markdown_mode": markdown_mode,
-                "style": style_mode,
-                "split_chapters": split_chapters,
-                "chapter_fallback": chapter_fallback,
-                "notes_mode": notes_mode,
-                "ocr_cleanup": ocr_cleanup,
-                "nav_cleanup": nav_cleanup,
-                "filename_scheme": filename_scheme,
-            },
-        }
-        manifest_path.write_text(
-            json.dumps(manifest_payload, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
-
-    if quality_report == "v1":
-        report_path = book_dir / "report.v1.json"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_payload = {
-            "toc_stats": {
-                "entries": toc_entry_count,
-                "unique_hrefs": toc_unique_count,
-                "coverage_ratio": round(toc_coverage_ratio, 4),
-                "degenerate": toc_is_degenerate,
-            },
-            "fallback_stats": {
-                "mode": chapter_fallback,
-                "used_heading_fallback": use_heading_fallback,
-            },
-            "link_stats": {
-                "rewritten": link_rewritten,
-                "unresolved": link_unresolved,
-            },
-            "asset_stats": {
-                "images_extracted": extracted_count,
-                "media_extracted": extracted_media_count,
-                "missing_assets": len(
-                    [message for message in warnings if "missing media" in message]
-                ),
-            },
-            "ocr_stats": {
-                "mode": ocr_cleanup,
-                "cleanup_changes": cleanup_changes_total,
-            },
-            "cleanup_stats": {
-                "nav_cleanup_mode": nav_cleanup,
-                "toc_entries_removed": nav_removed,
-            },
-            "notes_stats": {
-                "mode": notes_mode,
-                "notes_written": notes_total,
-            },
-            "warnings": warnings,
-            "errors": errors,
-        }
-        report_path.write_text(
-            json.dumps(report_payload, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
-
-    return output_root if split_chapters else output_dir / f"{book_slug}.md"
+    output_path = _write_markdown_outputs(
+        sections,
+        output_dir=output_dir,
+        book_dir=book_dir,
+        book_slug=book_slug,
+        title=title,
+        authors=authors,
+        style_header_lines=style_header_lines,
+        split_chapters=split_chapters,
+        notes_mode=notes_mode,
+        global_note_lines=stats.global_note_lines,
+    )
+    _write_manifest_export(
+        book_dir=book_dir,
+        enabled=export_manifest,
+        title=title,
+        authors=authors,
+        book_slug=book_slug,
+        spine_entries=spine_entries,
+        toc_entries=toc_entries,
+        sections=sections,
+        extracted_images=extracted_images,
+        extracted_media=extracted_media,
+        markdown_mode=markdown_mode,
+        style_mode=style_mode,
+        split_chapters=split_chapters,
+        chapter_fallback=chapter_fallback,
+        notes_mode=notes_mode,
+        ocr_cleanup=ocr_cleanup,
+        nav_cleanup=nav_cleanup,
+        filename_scheme=filename_scheme,
+    )
+    _write_quality_report(
+        book_dir=book_dir,
+        enabled=quality_report,
+        toc_entry_count=toc_entry_count,
+        toc_unique_count=toc_unique_count,
+        toc_coverage_ratio=toc_coverage_ratio,
+        toc_is_degenerate=toc_is_degenerate,
+        chapter_fallback=chapter_fallback,
+        use_heading_fallback=use_heading_fallback,
+        stats=stats,
+        extracted_count=extracted_count,
+        extracted_media_count=extracted_media_count,
+        ocr_cleanup=ocr_cleanup,
+        nav_cleanup=nav_cleanup,
+        nav_removed=nav_removed,
+        notes_mode=notes_mode,
+        warnings=warnings,
+        errors=errors,
+    )
+    return output_path
 
 
 def main() -> int:
