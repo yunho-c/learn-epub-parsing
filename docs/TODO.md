@@ -122,7 +122,7 @@ Status:
 
 Scope:
 - Canonical section boundary hashing -> stable `section_id`.
-- Add `--filename-scheme legacy|stable` (default `legacy`) for split output.
+- Add `--filename-scheme index|hash` (default `index`) for split output.
 
 Acceptance:
 - Stable mode produces deterministic chapter filenames independent of label order churn.

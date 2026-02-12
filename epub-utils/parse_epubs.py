@@ -1280,7 +1280,7 @@ def _assign_section_output_paths(
     for index, section in enumerate(sections, start=1):
         section_slug = _slugify(section.title) if section.title.strip() else f"section_{index:0{width}d}"
         section_slug = section_slug[:80].strip("_.-") or f"section_{index:0{width}d}"
-        if filename_scheme == "stable":
+        if filename_scheme == "hash":
             section.output_path = f"{section.section_id}_{section_slug}.md"
         else:
             section.output_path = f"{index:0{width}d}_{section_slug}.md"
@@ -1625,13 +1625,18 @@ def parse_epub(
     quality_report: str = "off",
     ocr_cleanup: str = "off",
     nav_cleanup: str = "auto",
-    filename_scheme: str = "legacy",
+    filename_scheme: str = "index",
 ) -> Optional[Path]:
     doc = Document(str(epub_path))
     metadata = doc.package.metadata
     title = _get_metadata_title(metadata) or epub_path.stem
     authors = _get_metadata_authors(metadata)
     book_slug = _slugify(title)
+    filename_scheme = (filename_scheme or "").strip().lower()
+    if filename_scheme not in {"index", "hash"}:
+        raise ValueError(
+            f"Invalid filename scheme '{filename_scheme}'. Expected 'index' or 'hash'."
+        )
     book_dir = output_dir / book_slug
 
     warnings: list[str] = []
@@ -2186,9 +2191,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--filename-scheme",
-        choices=["legacy", "stable"],
-        default="legacy",
-        help="Split-chapter output naming strategy.",
+        choices=["index", "hash"],
+        default="index",
+        help="Split-chapter output naming strategy (index or hash).",
     )
     args = parser.parse_args()
 

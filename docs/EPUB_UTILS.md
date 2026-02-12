@@ -45,7 +45,7 @@ This repo provides a small, opinionated pipeline for turning EPUBs into Markdown
      - `--nav-cleanup off|auto` (TOC dedupe/noise suppression)
      - `--ocr-cleanup off|basic|aggressive`
    - Optional deterministic split naming:
-     - `--filename-scheme legacy|stable`
+     - `--filename-scheme index|hash`
 
 ## Output layout
 
@@ -109,7 +109,7 @@ python3 epub-utils/parse_epubs.py --markdown-mode rich --style external
 - `--quality-report`: `off|v1`
 - `--ocr-cleanup`: `off|basic|aggressive`
 - `--nav-cleanup`: `off|auto`
-- `--filename-scheme`: `legacy|stable`
+- `--filename-scheme`: `index|hash`
 
 ## Heading fallback behavior
 

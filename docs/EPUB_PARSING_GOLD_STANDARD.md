@@ -164,8 +164,8 @@ Then sections:
 Split mode (`--split-chapters`):
 
 - Write one chapter file per section:
-  - `legacy`: `<NN>_<section_slug>.md`
-  - `stable`: `<section_id>_<section_slug>.md`
+  - `index`: `<NN>_<section_slug>.md`
+  - `hash`: `<section_id>_<section_slug>.md`
 - Place under `results/<book_slug>/`.
 - Before writing, remove stale `*.md` in that folder to avoid old/new mixed outputs.
 
@@ -205,7 +205,7 @@ Common controls used by both implementations:
 - `--quality-report off|v1`
 - `--ocr-cleanup off|basic|aggressive`
 - `--nav-cleanup off|auto`
-- `--filename-scheme legacy|stable`
+- `--filename-scheme index|hash`
 
 ## 11) Architecture parity in this repo
 
@@ -285,7 +285,7 @@ When reproducing this in mobile, validate against this repo outputs:
 7. Results remain stable across repeated runs.
 8. Heading fallback (`auto`) activates on degenerate TOC books (for example Internet Archive OCR EPUBs) and emits activation warnings.
 9. `manifest.v1.json` and `report.v1.json` are deterministic for repeated runs.
-10. Split mode with `--filename-scheme stable` keeps file names stable across TOC label churn.
+10. Split mode with `--filename-scheme hash` keeps file names stable across TOC label churn.
 
 ## 14) Known tradeoffs
 
