@@ -17,6 +17,8 @@ Legend:
 
 ## M1: Internal Link Rewrite + Validation
 
+[P0]
+
 Status:
 - `epub-utils`: `[x]`
 - `rbook-utils`: `[x]`
@@ -34,6 +36,8 @@ Acceptance:
 
 ## M2: Footnotes/Endnotes Modes
 
+[P0]
+
 Status:
 - `epub-utils`: `[x]` (markdown-footnote pattern support)
 - `rbook-utils`: `[x]` (markdown-footnote pattern support)
@@ -44,12 +48,18 @@ Scope:
 - `inline`: leave notes unchanged.
 - `chapter-end`: collect markdown note definitions at chapter end.
 - `global`: collect markdown note definitions into `results/<book_slug>/notes.md`.
+- Expand note detection beyond markdown-footnote patterns:
+  - EPUB semantic note refs (`epub:type="noteref"`, common note/backlink conventions)
+  - endnote sections that are not converted into markdown-footnote syntax
 
 Acceptance:
 - No-op with `inline`.
 - Chapter-end/global outputs produce stable note IDs and backlinks for markdown footnote refs.
+- Semantic note patterns (when present in source XHTML) resolve into the selected notes mode.
 
 ## M3: TOC + Landmarks + Page-List Export
+
+[P1]
 
 Status:
 - `epub-utils`: `[x]` (`manifest.v1.json`)
@@ -62,11 +72,18 @@ Scope:
   - `schema_version`, `book`, `spine`, `toc_tree`, `sections`,
   - `landmarks`, `page_list`, `assets`, `build`.
 - Include stable `section_id`, source boundary mapping, and output path.
+- Add schema contract docs + compatibility policy:
+  - versioning rules (`v1` evolution)
+  - required/optional fields
+  - forward/backward compatibility expectations
+- Replace placeholder-empty `landmarks`/`page_list` with parsed values when source EPUB provides them.
 
 Acceptance:
 - Manifest exists when enabled and contains deterministic section IDs.
 
 ## M4: Navigation Dedupe + OCR Cleanup
+
+[P1]
 
 Status:
 - `epub-utils`: `[x]`
@@ -85,6 +102,8 @@ Acceptance:
 
 ## M5: Asset Completeness + EPUB3 Media Handling
 
+[P1]
+
 Status:
 - `epub-utils`: `~` (images + manifest audio/video extraction)
 - `rbook-utils`: `~` (images + manifest audio/video extraction)
@@ -94,12 +113,20 @@ Scope:
 - Preserve existing image behavior.
 - Expand `--media-all` to include optional audio/video extraction.
 - Keep external/data URIs unchanged.
+- Add richer in-content asset reference handling:
+  - `srcset`
+  - `<picture><source ...>`
+  - SVG-linked image references
+  - CSS `url(...)` references where applicable in rich/external style paths
 
 Acceptance:
 - Image extraction remains backward compatible.
 - Audio/video extracted when discoverable from manifest and `--media-all` is enabled.
+- Richer asset refs resolve/extract with path rewriting in both split and single-file modes.
 
 ## M6: Typography/Semantics Normalization
+
+[P2]
 
 Status:
 - `epub-utils`: `[ ]`
@@ -115,6 +142,8 @@ Acceptance:
 
 ## M7: Deterministic IDs + Stable Filename Scheme
 
+[P1]
+
 Status:
 - `epub-utils`: `[x]`
 - `rbook-utils`: `[x]`
@@ -129,6 +158,8 @@ Acceptance:
 
 ## M8: Quality Report + Parity Gate
 
+[P0]
+
 Status:
 - `epub-utils`: `[x]` (`report.v1.json`)
 - `rbook-utils`: `[x]` (`report.v1.json`)
@@ -140,6 +171,13 @@ Scope:
   - TOC/fallback/link/asset/OCR/cleanup/notes stats
   - warnings/errors arrays
 - Add parity checks across both implementations.
+- Add automated parity fixture runner in CI:
+  - deterministic fixture corpus
+  - golden checks for section counts/titles/IDs
+  - unresolved-link and missing-asset thresholds
+- Track unresolved-link regressions:
+  - baseline known unresolveds per fixture
+  - fail CI on unexpected increases
 
 Acceptance:
 - Both parsers generate machine-readable report files with matching key metrics.
@@ -147,10 +185,12 @@ Acceptance:
 
 ## Final Integration Gate
 
-- `[ ]` Run lockstep commands for both parsers on reference books (`Alice`, `Meditations`, `Algebra`, `CBT`, `Ultralearning`).
-- `[ ]` Compare:
+- `[ ]` [P0] Run lockstep commands for both parsers on reference books (`Alice`, `Meditations`, `Algebra`, `CBT`, `Ultralearning`).
+- `[ ]` [P0] Compare:
   - section counts
   - first N section titles/IDs
   - unresolved link counts
   - missing asset counts
-- `[ ]` Document known parity differences.
+- `[ ]` [P1] Document known parity differences.
+- `[ ]` [P1] Publish schema docs for `manifest.v1.json` and `report.v1.json` as part of release notes.
+- `[ ]` [P0] Run fixture-based CI parity job successfully on target platforms.
